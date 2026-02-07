@@ -4,9 +4,12 @@ router = SearchRouter()
 
 query = input("Enter query: ")
 
-results = router.route(query)
+print("\n--- HYBRID ONLY ---")
+results = router.hybrid.search(query, use_reranker=False)
 
-print("\nResults:\n")
+print("\n--- HYBRID + RERANKER ---")
+results = router.hybrid.search(query, use_reranker=True)
+
 
 seen = set()   # ✅ FIX — define this
 

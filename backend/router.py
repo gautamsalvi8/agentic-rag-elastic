@@ -11,3 +11,12 @@ class SearchRouter:
 
     def route(self, query):
         return self.hybrid.search(query)
+    
+
+class SearchRouter:
+    def __init__(self):
+        self.hybrid = HybridSearch()
+
+    def route(self, query):
+        return self.hybrid.search(query)
+
