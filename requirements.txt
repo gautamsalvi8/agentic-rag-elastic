@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+elasticsearch
+langchain
+langchain-elasticsearch
+langchain-openai
+pypdf
+python-dotenv

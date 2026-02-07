@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Secrets & Environment
+.env
+
+# Local Data/Database
+embeddings/
+data/*.pdf
+
+# OS files
+.DS_Store
+Thumbs.db
