@@ -3,6 +3,7 @@ from generator import Generator
 from hybrid_search import HybridSearch
 from reranker import Reranker
 from benchmark import Timer
+from benchmark import run_query_benchmark
 
 
 router = SearchRouter()
@@ -68,3 +69,15 @@ print(answer)
 
 # ---- LATENCY REPORT ----
 timer.report()
+
+
+queries = [
+    "what is elastic",
+    "what is vector search",
+    "what is hybrid retrieval",
+    "explain bm25",
+    "how elastic scales"
+]
+
+run_query_benchmark(search, gen, queries)
+

@@ -10,8 +10,8 @@ class Generator:
         # ✅ TinyLlama chat model
         self.llm = pipeline(
             task="text-generation",
-            model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-            max_new_tokens=150,
+            model="google/flan-t5-small",
+            max_new_tokens=120,
             do_sample=False,              # deterministic answers
             return_full_text=False        # ⭐ prevents prompt echo
         )
