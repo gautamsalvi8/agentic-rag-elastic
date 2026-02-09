@@ -1,83 +1,134 @@
+from fastapi import FastAPI, UploadFile, File
+from pydantic import BaseModel
+import time
+
 from router import SearchRouter
 from generator import Generator
 from hybrid_search import HybridSearch
 from reranker import Reranker
-from benchmark import Timer
-from benchmark import run_query_benchmark
+from benchmark import Timer, run_query_benchmark
+from retriever import retrieve_chunks
+from llm import ask_llm
+from memory_router import MemoryRouter
 
 
+# =====================================
+# INIT COMPONENTS (load once only)
+# =====================================
+
+app = FastAPI(title="Agentic RAG API")
+
+memory = MemoryRouter()
 router = SearchRouter()
 search = HybridSearch()
 reranker = Reranker()
 gen = Generator(prompt_style="STRICT")
-timer = Timer()
 
 
-query = input("Enter query: ")
+# =====================================
+# REQUEST MODELS
+# =====================================
+
+class ChatRequest(BaseModel):
+    query: str
 
 
-# =====================================================
-# PART 1 — SHOW RAW SEARCH RESULTS (your original logic)
-# =====================================================
-
-print("\n--- HYBRID ONLY ---")
-results = router.hybrid.search(query, use_reranker=False)
-
-print("\n--- HYBRID + RERANKER ---")
-results = router.hybrid.search(query, use_reranker=True)
+class BenchmarkRequest(BaseModel):
+    queries: list[str]
 
 
-seen = set()
+# =====================================
+# CHAT ENDPOINT (MAIN ONE)
+# =====================================
 
-for r in results:
-    if r not in seen:
-        print("-", r)
-        seen.add(r)
+@app.post("/chat")
+def chat(req: ChatRequest):
 
+    query = req.query
 
-# =====================================================
-# PART 2 — FULL RAG PIPELINE (ADDED, not removed)
-# =====================================================
+    # -------------------------
+    # MEMORY vs SEARCH ROUTING
+    # -------------------------
+    if memory.should_search(query):
+        route = "search"
 
-print("\n==============================")
-print("🚀 Running Full RAG Pipeline")
-print("==============================")
+        start = time.time()
+        chunks, _ = retrieve_chunks(query)
+        context = "\n\n".join(list(dict.fromkeys(chunks)))[:3000]
+        search_time = round(time.time() - start, 3)
 
-
-# ---- SEARCH ----
-timer.start("Search")
-docs = search.search(query, k=10)
-timer.stop("Search")
-
-
-# ---- RERANK ----
-timer.start("Rerank")
-docs = reranker.rerank(query, docs, top_k=5)
-timer.stop("Rerank")
+    else:
+        route = "memory"
+        context = memory.get_context()
+        search_time = 0
 
 
-# ---- GENERATE ----
-timer.start("LLM")
-answer = gen.generate(query, docs)
-timer.stop("LLM")
+    # -------------------------
+    # LLM GENERATION
+    # -------------------------
+    answer, llm_time = ask_llm(query, context)
+
+    memory.save(query, answer)
 
 
-# ---- FINAL ANSWER ----
-print("\n🧠 Answer:\n")
-print(answer)
+    return {
+        "route": route,
+        "answer": answer,
+        "search_latency": search_time,
+        "llm_latency": llm_time
+    }
 
 
-# ---- LATENCY REPORT ----
-timer.report()
+# =====================================
+# FULL RAG PIPELINE ENDPOINT
+# (optional advanced)
+# =====================================
+
+@app.post("/rag")
+def rag(req: ChatRequest):
+
+    query = req.query
+    timer = Timer()
+
+    timer.start("Search")
+    docs = search.search(query, k=10)
+    timer.stop("Search")
+
+    timer.start("Rerank")
+    docs = reranker.rerank(query, docs, top_k=5)
+    timer.stop("Rerank")
+
+    timer.start("LLM")
+    answer = gen.generate(query, docs)
+    timer.stop("LLM")
+
+    return {
+        "answer": answer,
+        "metrics": timer.times
+    }
 
 
-queries = [
-    "what is elastic",
-    "what is vector search",
-    "what is hybrid retrieval",
-    "explain bm25",
-    "how elastic scales"
-]
+# =====================================
+# BENCHMARK (NOW USER DEFINED)
+# =====================================
 
-run_query_benchmark(search, gen, queries)
+@app.post("/benchmark")
+def benchmark(req: BenchmarkRequest):
+    results = run_query_benchmark(search, gen, req.queries)
+    return results
 
+
+# =====================================
+# FILE UPLOAD (future indexing)
+# =====================================
+
+@app.post("/upload")
+def upload_file(file: UploadFile = File(...)):
+    content = file.file.read().decode("utf-8")
+
+    # later → index to elastic
+    return {
+        "filename": file.filename,
+        "size": len(content),
+        "status": "uploaded"
+    }

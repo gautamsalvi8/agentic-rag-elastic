@@ -34,3 +34,6 @@ if __name__ == "__main__":
 
     for hit in results:
         print("→", hit["_source"]["text"])
+        
+        
+
