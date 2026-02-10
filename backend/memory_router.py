@@ -1,5 +1,4 @@
 class MemoryRouter:
-
     def __init__(self):
         self.history = []  # list of (query, answer)
 
@@ -7,15 +6,13 @@ class MemoryRouter:
         query = query.lower()
         words = query.split()
 
-        follow_words = [
-            "it", "that", "more", "then", "also"
-        ]
+        follow_words = ["it", "that", "more", "then", "also"]
 
-        # follow-up short queries only
+        # short follow-up → memory
         if len(words) < 4 and any(w in words for w in follow_words):
-            return False  # 🧠 memory
+            return False
 
-        return True  # 🔍 search
+        return True  # otherwise search
 
     def save(self, query, answer):
         self.history.append((query, answer))

@@ -1,7 +1,10 @@
 import os
 from dotenv import load_dotenv
+
+# REMOVE the dots from these two:
 from sentence_transformers import SentenceTransformer
 from elasticsearch import Elasticsearch
+
 
 load_dotenv()
 

@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 import time
 
+# Add a dot before each local module name
 from router import SearchRouter
 from generator import Generator
 from hybrid_search import HybridSearch

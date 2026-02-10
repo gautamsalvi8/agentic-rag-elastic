@@ -3,69 +3,76 @@ import time
 
 
 class Generator:
-    def __init__(self, prompt_style="STRICT"):
-
+    def __init__(self, prompt_style="SMART"):
         self.prompt_style = prompt_style
 
-        # ✅ TinyLlama chat model
         self.llm = pipeline(
-            task="text-generation",
+            task="text2text-generation",
             model="google/flan-t5-small",
-            max_new_tokens=120,
-            do_sample=False,              # deterministic answers
-            return_full_text=False        # ⭐ prevents prompt echo
+            temperature=0.3,
+            max_new_tokens=512
         )
 
-    # --------------------------------------------------
-    # Prompt Builder
-    # --------------------------------------------------
-    def build_prompt(self, query, docs):
+    # =============================
+    # 🔥 BETTER PROMPT ENGINEERING
+    # =============================
+    def build_prompt(self, query, docs, history=""):
+        context = "\n\n".join(docs[:3])
 
-        context = "\n\n".join(docs)
+        prompt = f"""
+You are a smart document assistant.
 
-        # ⭐ Chat style works MUCH better for TinyLlama
-        if self.prompt_style == "STRICT":
-            prompt = f"""<|system|>
-You are a helpful AI assistant.
-Answer ONLY using the provided context.
-If answer is not present, say "Not found".
-<|user|>
+STYLE:
+• concise but informative
+• use bullets or short paragraphs
+• beginner friendly if asked
+• summarize instead of copying
+• highlight key terms
+• avoid fluff
+
+RULES:
+• ONLY use context
+• if missing → say "Not found in documents"
+
+Chat History:
+{history}
+
 Context:
 {context}
 
-Question: {query}
-<|assistant|>
-"""
-        else:
-            prompt = f"""<|user|>
-Context:
-{context}
+Question:
+{query}
 
-Question: {query}
-<|assistant|>
+Answer:
 """
 
         return prompt
 
-    # --------------------------------------------------
-    # Generate Answer
-    # --------------------------------------------------
-    def generate(self, query, docs):
-
-        prompt = self.build_prompt(query, docs)
+    # =============================
+    # GENERATION
+    # =============================
+    def generate(self, query, docs, history=""):
+        prompt = self.build_prompt(query, docs, history)
 
         start = time.time()
 
-        output = self.llm(prompt)
+        output = self.llm(
+            prompt,
+            num_beams=4,
+            early_stopping=True,
+            min_length=30,
+            max_length=400
+        )
 
         latency = time.time() - start
 
         answer = output[0]["generated_text"].strip()
 
-        # simple token estimate
-        approx_tokens = len(prompt.split()) + len(answer.split())
-
-        print(f"\n📊 Tokens used (approx): {approx_tokens}")
-        print(f"⚡ LLM latency: {round(latency, 3)}s")
+        print(f"⚡ LLM latency: {latency:.2f}s")
 
         return answer
+
+
+def generate_answer(query, docs, history_context=""):
+    gen = Generator()
+    return gen.generate(query, docs, history_context)

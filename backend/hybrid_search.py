@@ -1,10 +1,17 @@
 import os
 import time
+
+# --- EXTERNAL LIBRARIES (No dots) ---
 from dotenv import load_dotenv
 from elasticsearch import Elasticsearch
 from sentence_transformers import SentenceTransformer
+
+# --- INTERNAL FILES (Remove the dots!) ---
 from cache import get_cached_query, set_cached_query
 from reranker import Reranker
+
+load_dotenv()
+# ... rest of your code
 
 load_dotenv()
 
