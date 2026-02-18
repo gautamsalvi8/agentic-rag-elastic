@@ -266,35 +266,73 @@ def _restore_session_from_sid(sid: str) -> bool:
     return True
 
 
-# ---------- Refresh pe session restore: URL mein sid ho to file se session bhar do ----------
+# ---------- Query params: sid (server store) + restore_key (cookie se key, server restart pe bhi kaam) ----------
 try:
-    _sid = st.query_params.get("sid") if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
+    _qp = st.query_params if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
+    _sid = _qp.get("sid") if _qp else None
+    _restore_key_b64 = _qp.get("restore_key") if _qp else None
 except Exception:
     _sid = None
+    _restore_key_b64 = None
+
+# Reopen: URL mein restore_key ho to cookie se aayi hui key se session bharo, phir URL se hata do (server store zaroori nahi)
+if _restore_key_b64 and not st.session_state.authenticated:
+    try:
+        _b64 = _restore_key_b64.replace(" ", "+")  # URL mein + space ban sakta hai
+        _pad = (4 - len(_b64) % 4) % 4
+        _key_bytes = base64.urlsafe_b64decode(_b64 + ("=" * _pad))
+        _key_str = _key_bytes.decode("utf-8", errors="replace").strip()
+        if _key_str and _key_str.startswith("gsk_"):
+            _ok, _ = _validate_groq_api_key(_key_str)
+            if _ok:
+                st.session_state.authenticated = True
+                st.session_state.groq_api_key = _key_str
+                st.session_state.auth_provider = "groq"
+                st.session_state.username = "Groq " + _groq_key_fingerprint(_key_str) if _groq_key_fingerprint(_key_str) else "Groq User"
+                st.session_state._user_db_key = hashlib.sha256(_key_str.encode()).hexdigest()[:16]
+                _save_user_groq_key(_key_str)
+                try:
+                    st.query_params.clear()
+                except Exception:
+                    pass
+                st.rerun()
+    except Exception:
+        pass
+
+# Refresh / same-tab: URL mein sid ho to file/users se session bhar do
 if _sid and not st.session_state.authenticated:
     if _restore_session_from_sid(_sid):
         st.rerun()
 
-# ---------- Site band karke dubara open: cookie se sid restore (redirect to ?sid=...) ----------
-# Streamlit iframe mein cookie set/read top window pe karo + Secure for HTTPS (elasticnode-ai.streamlit.app).
-if not st.session_state.authenticated and not _sid:
-    # Logout ke baad cookie hata do taaki dobara open pe key maange
+# ---------- Site band karke dubara open: cookie se restore (pehle elastic_key, phir elastic_sid) ----------
+if not st.session_state.authenticated and not _sid and not _restore_key_b64:
+    # Logout ke baad dono cookies hata do
     if st.session_state.get("_just_logged_out"):
         _clear_cookie = """<script>(function(){
-            var c = "elastic_sid=; path=/; max-age=0; Secure";
-            try { if (window.top.document) window.top.document.cookie = c; } catch(e) {}
-            try { document.cookie = c; } catch(e) {}
+            var c1 = "elastic_sid=; path=/; max-age=0; Secure";
+            var c2 = "elastic_key=; path=/; max-age=0; Secure";
+            try { if (window.top.document) { window.top.document.cookie = c1; window.top.document.cookie = c2; } } catch(e) {}
+            try { document.cookie = c1; document.cookie = c2; } catch(e) {}
         })();</script>"""
         components.html(_clear_cookie, height=0)
         st.session_state["_just_logged_out"] = False
+    # Cookie mein key/sid ho to redirect: key pehle (server restart pe bhi chalega), phir sid
     _cookie_restore_html = """
     <script>
     (function() {
         var doc = (window.top && window.top.document) ? window.top.document : document;
-        var m = (doc.cookie || "").match(/elastic_sid=([^;]+)/);
-        if (m && !window.location.search.includes('sid=')) {
-            var q = window.location.search ? window.location.search + '&' : '?';
-            window.top.location.replace(window.location.pathname + q + 'sid=' + encodeURIComponent(m[1].trim()));
+        var c = doc.cookie || "";
+        if (window.location.search.includes("sid=") || window.location.search.includes("restore_key=")) return;
+        var mKey = c.match(/elastic_key=([^;]+)/);
+        if (mKey) {
+            var q = window.location.search ? window.location.search + "&" : "?";
+            window.top.location.replace(window.location.pathname + q + "restore_key=" + encodeURIComponent(mKey[1].trim()));
+            return;
+        }
+        var mSid = c.match(/elastic_sid=([^;]+)/);
+        if (mSid) {
+            var q = window.location.search ? window.location.search + "&" : "?";
+            window.top.location.replace(window.location.pathname + q + "sid=" + encodeURIComponent(mSid[1].trim()));
         }
     })();
     </script>
@@ -397,15 +435,20 @@ if False and not _user_groq:  # dead: key-only login
     st.caption("You won’t get access to the app until a key is saved for your account.")
     st.stop()
 
-# Login ke baad sid ko cookie mein daalo (top window + Secure): site band karke dubara open pe bhi restore
+# Login ke baad sid + key dono cookie mein (top window + Secure): site band/reopen pe bhi restore, server restart pe bhi
 try:
-    _qsid = st.query_params.get("sid") if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
+    _qp = st.query_params if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
+    _qsid = _qp.get("sid") if _qp else None
+    _qkey = (st.session_state.get("groq_api_key") or "").strip()
     if st.session_state.get("authenticated") and _qsid and not st.session_state.get("_sid_cookie_set"):
         _safe_sid = _qsid.replace("\\", "\\\\").replace('"', '\\"').replace(";", "")[:64]
+        _key_b64 = base64.urlsafe_b64encode(_qkey.encode()).decode().rstrip("=") if _qkey else ""
+        _safe_key_b64 = _key_b64.replace("\\", "\\\\").replace('"', '\\"').replace(";", "")[:256]
         _set_cookie = f'''<script>(function(){{
-            var c = "elastic_sid={_safe_sid}; path=/; max-age=7776000; SameSite=Lax; Secure";
-            try {{ if (window.top.document) window.top.document.cookie = c; }} catch(e) {{}}
-            try {{ document.cookie = c; }} catch(e) {{}}
+            var c1 = "elastic_sid={_safe_sid}; path=/; max-age=7776000; SameSite=Lax; Secure";
+            var c2 = "elastic_key=" + "{_safe_key_b64}" + "; path=/; max-age=7776000; SameSite=Lax; Secure";
+            try {{ if (window.top.document) {{ window.top.document.cookie = c1; window.top.document.cookie = c2; }} }} catch(e) {{}}
+            try {{ document.cookie = c1; document.cookie = c2; }} catch(e) {{}}
         }})();</script>'''
         components.html(_set_cookie, height=0)
         st.session_state["_sid_cookie_set"] = True
