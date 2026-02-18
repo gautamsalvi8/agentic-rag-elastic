@@ -265,6 +265,15 @@ if False and not _user_groq:  # dead: key-only login
 if "groq_api_key" not in st.session_state or not (st.session_state.get("groq_api_key") or "").strip():
     st.session_state.groq_api_key = _get_user_groq_key() or os.getenv("GROQ_API_KEY", "")
 
+# Load per-user conversation history from disk (frontend/users.json) once per session
+_db_key = _get_current_user_db_key()
+if _db_key and not st.session_state.get("_conversations_loaded"):
+    _users = _load_users()
+    convs = (_users.get(_db_key) or {}).get("conversations")
+    if isinstance(convs, dict):
+        st.session_state.conversations = convs
+    st.session_state._conversations_loaded = True
+
 # Groq session sync: Jab tak Groq account login hai tab tak site login. Groq se logout/revoke = site se auto logout.
 # Key ko periodically validate karte hain; invalid (revoke ya Groq logout) hone par session clear → user ko dubara key dalni padegi.
 if st.session_state.get("authenticated") and st.session_state.get("auth_provider") == "groq":
@@ -1117,6 +1126,18 @@ elif st.session_state.current_view == "accounts":
     st.markdown("<h2 class='dashboard-title' style='text-align:center;'>Accounts</h2>", unsafe_allow_html=True)
     st.info("Accounts page — manage your account here.")
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # Persist per-user conversation history to disk on each rerun
+_db_key_persist = _get_current_user_db_key()
+if _db_key_persist:
+    try:
+        _users_persist = _load_users()
+        if _db_key_persist not in _users_persist:
+            _users_persist[_db_key_persist] = {}
+        _users_persist[_db_key_persist]["conversations"] = st.session_state.get("conversations", {}) or {}
+        _save_users(_users_persist)
+    except Exception:
+        pass
 
 # CHAT VIEW (DEFAULT)
 else:
