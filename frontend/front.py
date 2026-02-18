@@ -1,7 +1,11 @@
 import sys, os, importlib
 import base64
 import hashlib
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'backend')))
+
+# Ensure project root is on sys.path so `backend.*` imports work both locally and on Streamlit Cloud.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 
 import streamlit as st
 from streamlit.errors import StreamlitAuthError
