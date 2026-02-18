@@ -70,7 +70,7 @@ def _handle_logout():
         pass
     for _k in ["messages", "conversations", "current_view",
                 "last_response", "chat_draft", "docs", "doc_files", "_pending_docs_for_badge",
-                "_user_db_key", "groq_api_key", "generator", "model_loaded", "_history_loaded", "_sid_cookie_set"]:
+                "_user_db_key", "groq_api_key", "hf_api_key", "generator", "model_loaded", "_history_loaded", "_sid_cookie_set"]:
         st.session_state.pop(_k, None)
 
 st.set_page_config(
@@ -251,88 +251,216 @@ def _save_session_store(store: dict):
 
 
 def _restore_session_from_sid(sid: str) -> bool:
-    """If sid is valid, restore session state and return True."""
+    """If sid is valid, restore session state and return True (Google or legacy Groq session)."""
     if not (sid or "").strip():
         return False
     store = _load_session_store()
     data = store.get((sid or "").strip())
-    if not data or not data.get("groq_api_key"):
+    if not data:
         return False
+    provider = data.get("auth_provider") or ("groq" if data.get("groq_api_key") else "google")
     st.session_state.authenticated = True
-    st.session_state.groq_api_key = data.get("groq_api_key", "")
-    st.session_state.auth_provider = "groq"
+    st.session_state.auth_provider = provider
     st.session_state._user_db_key = data.get("_user_db_key", "")
-    st.session_state.username = data.get("username", "Groq User")
+    st.session_state.username = data.get("username", "User")
+    if data.get("groq_api_key"):
+        st.session_state.groq_api_key = data.get("groq_api_key", "")
     return True
 
 
-# ---------- Query params: sid (server store) + restore_key (cookie se key, server restart pe bhi kaam) ----------
+def _get_google_auth_config():
+    """Return auth config from secrets or None if not configured."""
+    try:
+        auth = st.secrets.get("auth", {})
+        if isinstance(auth, dict) and auth.get("client_id") and auth.get("client_secret"):
+            return {
+                "client_id": auth["client_id"],
+                "client_secret": auth["client_secret"],
+                "redirect_uri": auth.get("redirect_uri", ""),
+                "server_metadata_url": auth.get("server_metadata_url", "https://accounts.google.com/.well-known/openid-configuration"),
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _google_oauth_login_url():
+    """Return (authorization_url, state) for Google OAuth. State is stored in session for callback."""
+    import requests
+    config = _get_google_auth_config()
+    if not config or not config.get("redirect_uri"):
+        return None, None
+    try:
+        r = requests.get(config["server_metadata_url"], timeout=10)
+        meta = r.json()
+        auth_endpoint = meta.get("authorization_endpoint")
+        if not auth_endpoint:
+            return None, None
+        state = secrets.token_urlsafe(24)
+        st.session_state["_oauth_state"] = state
+        scope = "openid email profile"
+        url = (
+            auth_endpoint
+            + "?client_id=" + requests.utils.quote(config["client_id"])
+            + "&redirect_uri=" + requests.utils.quote(config["redirect_uri"])
+            + "&response_type=code"
+            + "&scope=" + requests.utils.quote(scope)
+            + "&state=" + state
+            + "&access_type=offline&prompt=consent"
+        )
+        return url, state
+    except Exception:
+        return None, None
+
+
+def _google_oauth_callback(code: str, state: str) -> dict:
+    """Exchange code for token and return userinfo {email, name, sub}. On failure return {}."""
+    import requests
+    config = _get_google_auth_config()
+    if not config:
+        return {}
+    saved_state = st.session_state.get("_oauth_state")
+    if not saved_state or saved_state != state:
+        return {}
+    try:
+        r = requests.get(config["server_metadata_url"], timeout=10)
+        meta = r.json()
+        token_endpoint = meta.get("token_endpoint")
+        userinfo_endpoint = meta.get("userinfo_endpoint") or meta.get("userinfo_endpoint")
+        if not token_endpoint:
+            return {}
+        # Exchange code for token
+        tr = requests.post(
+            token_endpoint,
+            data={
+                "code": code,
+                "client_id": config["client_id"],
+                "client_secret": config["client_secret"],
+                "redirect_uri": config["redirect_uri"],
+                "grant_type": "authorization_code",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
+        if tr.status_code != 200:
+            return {}
+        token = tr.json()
+        access_token = token.get("access_token")
+        if not access_token:
+            return {}
+        # Get userinfo
+        ur = requests.get(
+            userinfo_endpoint or "https://openidconnect.googleapis.com/v1/userinfo",
+            headers={"Authorization": "Bearer " + access_token},
+            timeout=10,
+        )
+        if ur.status_code != 200:
+            return {}
+        return ur.json()
+    except Exception:
+        return {}
+    finally:
+        st.session_state.pop("_oauth_state", None)
+
+
+# ---------- Query params: OAuth callback, sid restore, then API keys from localStorage (restore_groq/restore_hf) ----------
 try:
     _qp = st.query_params if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
     _sid = _qp.get("sid") if _qp else None
-    _restore_key_b64 = _qp.get("restore_key") if _qp else None
+    _code = _qp.get("code") if _qp else None
+    _state = _qp.get("state") if _qp else None
+    _restore_groq = _qp.get("restore_groq") if _qp else None
+    _restore_hf = _qp.get("restore_hf") if _qp else None
 except Exception:
-    _sid = None
-    _restore_key_b64 = None
+    _sid = _code = _state = _restore_groq = _restore_hf = None
 
-# Reopen: URL mein restore_key ho to cookie se aayi hui key se session bharo, phir URL se hata do (server store zaroori nahi)
-if _restore_key_b64 and not st.session_state.authenticated:
+# 1) OAuth callback: Google redirected back with code & state
+if _code and _state and not st.session_state.authenticated:
+    userinfo = _google_oauth_callback(_code, _state)
+    if userinfo:
+        email = (userinfo.get("email") or "").strip().lower()
+        name = (userinfo.get("name") or userinfo.get("email") or "User").strip()
+        sub = userinfo.get("sub", "")
+        _register_google_user(email, name, sub)
+        db_key = _google_user_key(email)
+        st.session_state.authenticated = True
+        st.session_state.auth_provider = "google"
+        st.session_state.username = name or email or "User"
+        st.session_state._user_db_key = db_key
+        sid = secrets.token_urlsafe(16)
+        store = _load_session_store()
+        store[sid] = {
+            "auth_provider": "google",
+            "_user_db_key": db_key,
+            "username": st.session_state.username,
+        }
+        _save_session_store(store)
+        try:
+            st.query_params.clear()
+            st.query_params["sid"] = sid
+        except Exception:
+            pass
+        st.rerun()
+    else:
+        st.session_state.auth_error = "Google sign-in failed. Try again."
     try:
-        _b64 = _restore_key_b64.replace(" ", "+")  # URL mein + space ban sakta hai
-        _pad = (4 - len(_b64) % 4) % 4
-        _key_bytes = base64.urlsafe_b64decode(_b64 + ("=" * _pad))
-        _key_str = _key_bytes.decode("utf-8", errors="replace").strip()
-        if _key_str and _key_str.startswith("gsk_"):
-            _ok, _ = _validate_groq_api_key(_key_str)
-            if _ok:
-                st.session_state.authenticated = True
-                st.session_state.groq_api_key = _key_str
-                st.session_state.auth_provider = "groq"
-                st.session_state.username = "Groq " + _groq_key_fingerprint(_key_str) if _groq_key_fingerprint(_key_str) else "Groq User"
-                st.session_state._user_db_key = hashlib.sha256(_key_str.encode()).hexdigest()[:16]
-                _save_user_groq_key(_key_str)
-                try:
-                    st.query_params.clear()
-                except Exception:
-                    pass
-                st.rerun()
+        st.query_params.clear()
     except Exception:
         pass
+    st.rerun()
 
-# Refresh / same-tab: URL mein sid ho to file/users se session bhar do
+# 2) Restore session from sid (refresh or cookie redirect)
 if _sid and not st.session_state.authenticated:
     if _restore_session_from_sid(_sid):
         st.rerun()
 
-# ---------- Site band karke dubara open: cookie se restore (pehle elastic_key, phir elastic_sid) ----------
-if not st.session_state.authenticated and not _sid and not _restore_key_b64:
-    # Logout ke baad dono cookies hata do
+# 3) Authenticated: restore API keys from localStorage (restore_groq / restore_hf in URL)
+if st.session_state.authenticated and (_restore_groq or _restore_hf):
+    try:
+        if _restore_groq:
+            _b64 = _restore_groq.replace(" ", "+")
+            _pad = (4 - len(_b64) % 4) % 4
+            _key_bytes = base64.urlsafe_b64decode(_b64 + ("=" * _pad))
+            _key_str = _key_bytes.decode("utf-8", errors="replace").strip()
+            if _key_str:
+                st.session_state.groq_api_key = _key_str
+                _save_user_groq_key(_key_str)
+        if _restore_hf:
+            _b64 = _restore_hf.replace(" ", "+")
+            _pad = (4 - len(_b64) % 4) % 4
+            _key_bytes = base64.urlsafe_b64decode(_b64 + ("=" * _pad))
+            _key_str = _key_bytes.decode("utf-8", errors="replace").strip()
+            if _key_str:
+                st.session_state.hf_api_key = _key_str
+    except Exception:
+        pass
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+    st.rerun()
+
+# 4) Not authenticated: cookie se sid restore (redirect to ?sid=...)
+if not st.session_state.authenticated and not _sid and not _code:
     if st.session_state.get("_just_logged_out"):
         _clear_cookie = """<script>(function(){
-            var c1 = "elastic_sid=; path=/; max-age=0; Secure";
-            var c2 = "elastic_key=; path=/; max-age=0; Secure";
-            try { if (window.top.document) { window.top.document.cookie = c1; window.top.document.cookie = c2; } } catch(e) {}
-            try { document.cookie = c1; document.cookie = c2; } catch(e) {}
+            var c = "elastic_sid=; path=/; max-age=0; Secure";
+            try { if (window.top.document) window.top.document.cookie = c; } catch(e) {}
+            try { document.cookie = c; } catch(e) {}
+            try { localStorage.removeItem('elastic_groq_key'); localStorage.removeItem('elastic_hf_key'); } catch(e) {}
         })();</script>"""
         components.html(_clear_cookie, height=0)
         st.session_state["_just_logged_out"] = False
-    # Cookie mein key/sid ho to redirect: key pehle (server restart pe bhi chalega), phir sid
     _cookie_restore_html = """
     <script>
     (function() {
         var doc = (window.top && window.top.document) ? window.top.document : document;
         var c = doc.cookie || "";
-        if (window.location.search.includes("sid=") || window.location.search.includes("restore_key=")) return;
-        var mKey = c.match(/elastic_key=([^;]+)/);
-        if (mKey) {
+        if (window.location.search.includes("sid=") || window.location.search.includes("code=")) return;
+        var m = c.match(/elastic_sid=([^;]+)/);
+        if (m) {
             var q = window.location.search ? window.location.search + "&" : "?";
-            window.top.location.replace(window.location.pathname + q + "restore_key=" + encodeURIComponent(mKey[1].trim()));
-            return;
-        }
-        var mSid = c.match(/elastic_sid=([^;]+)/);
-        if (mSid) {
-            var q = window.location.search ? window.location.search + "&" : "?";
-            window.top.location.replace(window.location.pathname + q + "sid=" + encodeURIComponent(mSid[1].trim()));
+            window.top.location.replace(window.location.pathname + q + "sid=" + encodeURIComponent(m[1].trim()));
         }
     })();
     </script>
@@ -360,104 +488,64 @@ if not st.session_state.authenticated:
     st.markdown("""
     <div class="auth-card">
         <div style="font-size: 2rem; margin-bottom: 0.25rem;">🤖</div>
-        <div class="auth-title">Sign in with Groq</div>
-        <div class="auth-subtitle">One key. One click. Instant access to your AI-powered docs.</div>
+        <div class="auth-title">Sign in with Google</div>
+        <div class="auth-subtitle">One click. Instant access to your AI-powered docs.</div>
     </div>
     """, unsafe_allow_html=True)
     if st.session_state.get("auth_error"):
         st.error(st.session_state.auth_error)
         st.session_state.auth_error = None
-    with st.form("groq_login_form"):
-        api_key = st.text_input("Groq API key", type="password", placeholder="gsk_...", help="Create key at console.groq.com → Keys")
-        submitted = st.form_submit_button("Sign in")
-        if submitted and api_key:
-            ok, err = _validate_groq_api_key(api_key)
-            if ok:
-                key_val = api_key.strip()
-                st.session_state.authenticated = True
-                st.session_state.groq_api_key = key_val
-                st.session_state.auth_provider = "groq"
-                st.session_state.username = "Groq " + _groq_key_fingerprint(key_val) if _groq_key_fingerprint(key_val) else "Groq User"
-                st.session_state._user_db_key = hashlib.sha256(key_val.encode()).hexdigest()[:16]
-                _save_user_groq_key(key_val)
-                # Refresh pe dubara key na maangne: sid URL mein + file mein save
-                sid = secrets.token_urlsafe(16)
-                store = _load_session_store()
-                store[sid] = {
-                    "groq_api_key": key_val,
-                    "_user_db_key": st.session_state._user_db_key,
-                    "username": st.session_state.username,
-                }
-                _save_session_store(store)
-                try:
-                    st.query_params["sid"] = sid
-                except Exception:
-                    pass
-                st.success("Signed in. Loading app...")
-                time.sleep(0.5)
-                st.rerun()
-            else:
-                st.error(err or "Invalid key.")
-        elif submitted:
-            st.error("Please enter your Groq API key.")
-    st.markdown("[Create API key at Groq Console →](https://console.groq.com/keys)")
-    st.caption("Login is only via Groq API key. No Google or password—just your key.")
+    auth_config = _get_google_auth_config()
+    if not auth_config:
+        st.warning("Google OAuth is not configured. Add `[auth]` with client_id, client_secret, redirect_uri in `.streamlit/secrets.toml` (see secrets.toml.example).")
+        st.caption("Create OAuth credentials at Google Cloud Console → APIs & Services → Credentials.")
+        st.stop()
+    auth_url, _ = _google_oauth_login_url()
+    if auth_url:
+        st.link_button("Sign in with Google", auth_url, type="primary", use_container_width=True)
+        st.caption("You will be redirected to Google to sign in. Session persists across refresh and browser close.")
+    else:
+        st.error("Could not generate Google login URL. Check redirect_uri in secrets.")
     st.stop()
 
-# (Login is Groq key only; no separate key gate.)
-_user_groq = _get_user_groq_key()
-if False and not _user_groq:  # dead: key-only login
-    st.markdown("""
-    <style>
-    * { font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
-    #MainMenu, footer, header { visibility: hidden; }
-    .stDeployButton { display: none; }
-    section[data-testid="stSidebar"] { display: none !important; }
-    html, body { margin: 0; padding: 0; min-height: 100vh; background: #fafafa !important; }
-    .main { background: #fafafa !important; padding: 0 !important; }
-    .block-container { padding: 2rem 1.5rem !important; max-width: 420px !important; margin: 0 auto !important; }
-    </style>
-    """, unsafe_allow_html=True)
-    st.markdown("### 🔑 Groq API key required")
-    st.markdown("To use ElasticNode AI, add your **Groq API key**. Create one (free) and paste it below.")
-    with st.form("groq_key_form"):
-        api_key = st.text_input("Groq API key", type="password", placeholder="gsk_...", help="Your key is stored securely per account.")
-        submitted = st.form_submit_button("Save & continue")
-        if submitted:
-            if api_key and api_key.strip():
-                _save_user_groq_key(api_key.strip())
-                st.session_state.groq_api_key = api_key.strip()
-                st.success("Key saved. Loading app...")
-                st.rerun()
-            else:
-                st.error("Please enter a valid API key.")
-    st.markdown("[Create API key at Groq Console →](https://console.groq.com/keys)")
-    st.caption("You won’t get access to the app until a key is saved for your account.")
-    st.stop()
-
-# Login ke baad sid + key dono cookie mein (top window + Secure): site band/reopen pe bhi restore, server restart pe bhi
+# Login ke baad sid cookie set (top window + Secure): site band/reopen pe bhi session restore
 try:
     _qp = st.query_params if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
     _qsid = _qp.get("sid") if _qp else None
-    _qkey = (st.session_state.get("groq_api_key") or "").strip()
     if st.session_state.get("authenticated") and _qsid and not st.session_state.get("_sid_cookie_set"):
         _safe_sid = _qsid.replace("\\", "\\\\").replace('"', '\\"').replace(";", "")[:64]
-        _key_b64 = base64.urlsafe_b64encode(_qkey.encode()).decode().rstrip("=") if _qkey else ""
-        _safe_key_b64 = _key_b64.replace("\\", "\\\\").replace('"', '\\"').replace(";", "")[:256]
         _set_cookie = f'''<script>(function(){{
-            var c1 = "elastic_sid={_safe_sid}; path=/; max-age=7776000; SameSite=Lax; Secure";
-            var c2 = "elastic_key=" + "{_safe_key_b64}" + "; path=/; max-age=7776000; SameSite=Lax; Secure";
-            try {{ if (window.top.document) {{ window.top.document.cookie = c1; window.top.document.cookie = c2; }} }} catch(e) {{}}
-            try {{ document.cookie = c1; document.cookie = c2; }} catch(e) {{}}
+            var c = "elastic_sid={_safe_sid}; path=/; max-age=7776000; SameSite=Lax; Secure";
+            try {{ if (window.top.document) window.top.document.cookie = c; }} catch(e) {{}}
+            try {{ document.cookie = c; }} catch(e) {{}}
         }})();</script>'''
         components.html(_set_cookie, height=0)
         st.session_state["_sid_cookie_set"] = True
 except Exception:
     pass
 
-# Ensure Groq key in session (set at login; or from saved user / env)
+# Ensure Groq key in session (from saved user, env, or restore_groq URL). If missing, try restore from localStorage.
 if "groq_api_key" not in st.session_state or not (st.session_state.get("groq_api_key") or "").strip():
     st.session_state.groq_api_key = _get_user_groq_key() or os.getenv("GROQ_API_KEY", "")
+# Authenticated but no keys yet: inject script to load from localStorage and redirect (restore_groq/restore_hf)
+if st.session_state.get("authenticated") and not (_restore_groq or _restore_hf):
+    _need_groq = not (st.session_state.get("groq_api_key") or "").strip()
+    if _need_groq:
+        _ls_restore = """
+        <script>
+        (function() {
+            if (window.location.search.includes('restore_groq=')) return;
+            var g = localStorage.getItem('elastic_groq_key');
+            var h = localStorage.getItem('elastic_hf_key');
+            if (!g && !h) return;
+            var q = window.location.search ? window.location.search + '&' : '?';
+            if (g) q += 'restore_groq=' + encodeURIComponent(g);
+            if (h) { if (g) q += '&'; q += 'restore_hf=' + encodeURIComponent(h); }
+            window.top.location.replace(window.location.pathname + q);
+        })();
+        </script>
+        """
+        components.html(_ls_restore, height=0)
 
 # Load per-user conversation history once per session, so refresh / restart ke baad bhi
 # account ke sath chats wapas aa sakein.
@@ -1301,28 +1389,55 @@ elif st.session_state.current_view == "history":
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-# SETTINGS VIEW
+# SETTINGS VIEW — API keys (saved to session + localStorage; ✏️ edit, clear on Logout)
 elif st.session_state.current_view == "settings":
     st.markdown('<div class="chat-container">', unsafe_allow_html=True)
     st.markdown("<h2 class='dashboard-title' style='text-align:center;'>Settings</h2>", unsafe_allow_html=True)
-    st.markdown("**Groq API key** — used for AI answers. Change it here to use a different key.")
-    with st.form("settings_groq_key"):
-        current_key = st.session_state.get("groq_api_key") or ""
-        new_key = st.text_input("Groq API key", value=current_key, type="password", placeholder="gsk_...", key="settings_groq_key_input")
-        st.caption("Get a key: [console.groq.com/keys](https://console.groq.com/keys)")
-        if st.form_submit_button("Save key"):
-            if (new_key or "").strip():
-                st.session_state.groq_api_key = new_key.strip()
-                st.session_state.generator = None
-                st.session_state.model_loaded = False
-                try:
-                    load_generator.clear()
-                except Exception:
-                    pass
-                st.success("Key updated. Model will reload on next use.")
-                st.rerun()
-            else:
-                st.error("Enter a valid API key.")
+    st.markdown("Enter your API keys below. They are saved in the browser (localStorage) and auto-load on next visit until you Logout or clear them.")
+    with st.form("settings_api_keys"):
+        current_groq = st.session_state.get("groq_api_key") or ""
+        current_hf = st.session_state.get("hf_api_key") or ""
+        new_groq = st.text_input("✏️ Groq API key", value=current_groq, type="password", placeholder="gsk_...", key="settings_groq_key_input", help="Used for AI answers. Get key at console.groq.com/keys")
+        new_hf = st.text_input("✏️ HuggingFace API key (optional)", value=current_hf, type="password", placeholder="hf_...", key="settings_hf_key_input", help="Optional, for some models")
+        st.caption("Get Groq key: [console.groq.com/keys](https://console.groq.com/keys)")
+        submitted = st.form_submit_button("Save keys")
+        if submitted:
+            groq_ok = (new_groq or "").strip()
+            hf_ok = (new_hf or "").strip()
+            groq_valid = False
+            if groq_ok:
+                _ok, _err = _validate_groq_api_key(groq_ok)
+                if not _ok:
+                    st.error(_err or "Invalid Groq key.")
+                else:
+                    groq_valid = True
+                    st.session_state.groq_api_key = groq_ok
+                    _save_user_groq_key(groq_ok)
+                    _b64 = base64.urlsafe_b64encode(groq_ok.encode()).decode().rstrip("=")
+                    _safe = _b64.replace("\\", "\\\\").replace('"', '\\"')[:256]
+                    components.html(f'<script>try{{var b="{_safe}".replace(/-/g,"+").replace(/_/g,"/"); while(b.length%4) b+="="; var k=decodeURIComponent(escape(atob(b))); localStorage.setItem("elastic_groq_key",k);}}catch(e){{}}</script>', height=0)
+                    st.session_state.generator = None
+                    st.session_state.model_loaded = False
+                    try: load_generator.clear()
+                    except Exception: pass
+            if hf_ok:
+                st.session_state.hf_api_key = hf_ok
+                _b64 = base64.urlsafe_b64encode(hf_ok.encode()).decode().rstrip("=")
+                _safe = _b64.replace("\\", "\\\\").replace('"', '\\"')[:256]
+                components.html(f'<script>try{{var b="{_safe}".replace(/-/g,"+").replace(/_/g,"/"); while(b.length%4) b+="="; var k=decodeURIComponent(escape(atob(b))); localStorage.setItem("elastic_hf_key",k);}}catch(e){{}}</script>', height=0)
+            if groq_valid or hf_ok:
+                st.success("Keys saved. Stored in browser (localStorage); will auto-load on next visit.")
+            st.rerun()
+    if st.button("Clear API keys (session + localStorage)", key="settings_clear_keys", type="secondary"):
+        st.session_state.groq_api_key = ""
+        st.session_state.hf_api_key = ""
+        st.session_state.generator = None
+        st.session_state.model_loaded = False
+        try: load_generator.clear()
+        except Exception: pass
+        components.html('<script>try{localStorage.removeItem("elastic_groq_key");localStorage.removeItem("elastic_hf_key");}catch(e){}</script>', height=0)
+        st.success("Keys cleared. Add new keys above or they will be cleared on Logout.")
+        st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ACCOUNTS VIEW
