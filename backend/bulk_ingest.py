@@ -17,7 +17,7 @@ import os
 from dotenv import load_dotenv
 from elasticsearch import Elasticsearch, helpers
 from sentence_transformers import SentenceTransformer
-from chunker import chunk_text
+from backend.chunker import chunk_text
 import time
 
 load_dotenv()

@@ -5,10 +5,10 @@ from elasticsearch import Elasticsearch
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any
 
-# Internal imports (no dots)
-from cache import get_cached_query, set_cached_query
-from reranker import Reranker
-from metrics_logger import MetricsLogger  # 🆕 Add this import
+# Relative imports so backend works as package (e.g. from frontend when path has project root)
+from backend.cache import get_cached_query, set_cached_query
+from backend.reranker import Reranker
+from backend.metrics_logger import MetricsLogger
 
 load_dotenv()
 
