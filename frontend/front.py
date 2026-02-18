@@ -61,7 +61,7 @@ st.set_page_config(
     page_title="ElasticNode AI",
     page_icon="🤖",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 USER_DB = os.path.join(os.path.dirname(__file__), "users.json")
@@ -360,11 +360,13 @@ html, body, [data-testid="stAppViewContainer"] {
     overflow-y: auto !important;
 }
 
-/* Sidebar: keep styling minimal so native collapse works */
+/* Sidebar: fully hidden — we only use the custom top hamburger menu */
 section[data-testid="stSidebar"] {
-    background: #ffffff !important;
-    font-family: var(--font-ui) !important;
-    font-size: var(--text-base) !important;
+    display: none !important;
+}
+/* Hide Streamlit's default sidebar toggle button */
+div[data-testid="collapsedControl"] {
+    display: none !important;
 }
 
 .stButton > button {
@@ -934,119 +936,6 @@ def init():
             st.error(f"❌ Model failed to load: {e}")
 
 init()
-
-# ============================================
-# NATIVE SIDEBAR (st.sidebar - guaranteed width)
-# ============================================
-with st.sidebar:
-    st.markdown("""
-    <div style='text-align: center; padding-bottom: 0.75rem; border-bottom: 1px solid #e5e5e5; margin-bottom: 0.75rem;'>
-        <div style='font-size: 1.3rem;'>🤖</div>
-        <div style='font-weight: 700; font-size: 1rem; margin-top: 0.25rem;'>ElasticNode</div>
-        <div style='font-size: 0.65rem; color: #525252;'>Agentic RAG</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    if st.button("➕ New Chat", key="new_chat_btn", use_container_width=True, type="primary"):
-        # Save current conversation (messages + docs) into history
-        if st.session_state.messages:
-            st.session_state.conversations[st.session_state.conversation_id] = {
-                "messages": st.session_state.messages.copy(),
-                "title": st.session_state.messages[0]['content'][:40] + "..." if st.session_state.messages else "New Chat",
-                "docs": list(st.session_state.get("docs", [])),
-                "doc_files": dict(st.session_state.get("doc_files", {})),
-            }
-        # Start a completely fresh chat context
-        st.session_state.messages = []
-        st.session_state.docs = []
-        st.session_state.doc_files = {}
-        st.session_state._pending_docs_for_badge = None
-        st.session_state.last_response = None
-        st.session_state.conversation_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        st.session_state.current_view = "chat"
-        st.rerun()
-
-    if st.session_state.conversations:
-        st.markdown("**Recent**")
-        for conv_id, conv in reversed(list(st.session_state.conversations.items())[-5:]):
-            cols = st.columns([4, 1])
-            with cols[0]:
-                if st.button(f"💬 {conv['title'][:20]}", key=f"load_{conv_id}", use_container_width=True):
-                    # Restore full state for the selected conversation
-                    st.session_state.messages = conv.get("messages", []).copy()
-                    st.session_state.docs = list(conv.get("docs", []))
-                    st.session_state.doc_files = dict(conv.get("doc_files", {}))
-                    st.session_state._pending_docs_for_badge = None
-                    st.session_state.last_response = None
-                    st.session_state.conversation_id = conv_id
-                    st.session_state.current_view = "chat"
-                    st.rerun()
-            with cols[1]:
-                if st.button("✏️", key=f"ren_{conv_id}"):
-                    st.session_state.rename_conversation = conv_id
-                    st.rerun()
-
-        if st.session_state.get("rename_conversation"):
-            st.markdown("---")
-            new_title = st.text_input("New title:",
-                                       value=st.session_state.conversations[st.session_state.rename_conversation]['title'],
-                                       key="rename_inp")
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("✓", key="save_ren", use_container_width=True):
-                    st.session_state.conversations[st.session_state.rename_conversation]['title'] = new_title
-                    st.session_state.rename_conversation = None
-                    st.rerun()
-            with c2:
-                if st.button("✗", key="cancel_ren", use_container_width=True):
-                    st.session_state.rename_conversation = None
-                    st.rerun()
-
-    st.markdown("---")
-    st.markdown("**Navigation**")
-
-    if st.button("💬 Chat", key="nav_chat", use_container_width=True,
-                 type="primary" if st.session_state.current_view == "chat" else "secondary"):
-        st.session_state.current_view = "chat"
-        st.rerun()
-
-    if st.button("📊 Metrics", key="nav_metrics", use_container_width=True,
-                 type="primary" if st.session_state.current_view == "metrics" else "secondary"):
-        st.session_state.current_view = "metrics"
-        st.rerun()
-
-    if st.button("📚 History", key="nav_history", use_container_width=True,
-                 type="primary" if st.session_state.current_view == "history" else "secondary"):
-        st.session_state.current_view = "history"
-        st.rerun()
-
-    if st.button("⚙️ Settings", key="nav_settings", use_container_width=True,
-                 type="primary" if st.session_state.current_view == "settings" else "secondary"):
-        st.session_state.current_view = "settings"
-        st.rerun()
-
-    st.markdown("---")
-    st.markdown("**API Key**")
-    st.link_button(
-        "🔑 Get Groq API Key",
-        url="https://console.groq.com/keys",
-        type="secondary",
-        use_container_width=True,
-        help="Create your API key at Groq (free). Add it to .env as GROQ_API_KEY=your_key"
-    )
-    st.caption("Create your key → add to .env as `GROQ_API_KEY`")
-
-    st.markdown("---")
-
-    un = st.session_state.get("username") or "User"
-    st.markdown(f"""
-    <div style='padding: 0.5rem; background: #f5f5f5; border-radius: 8px; margin-bottom: 0.5rem;'>
-        <div style='font-weight: 600; font-size: 0.8rem;'>👤 {un}</div>
-        <div style='font-size: 0.65rem; color: #525252; margin-top: 0.2rem;'>
-            {'✅' if st.session_state.model_loaded else '⏳'} • {len(st.session_state.docs)} docs
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
 
 # ============================================
 # MAIN CONTENT AREA
