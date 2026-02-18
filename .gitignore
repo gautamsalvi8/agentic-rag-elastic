@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Secrets & Environment
+.env
+.streamlit/secrets.toml
+
+# Local Data/Database
+users.json
+embeddings/
+data/*.pdf
+frontend/users.json
+
+# Local logs / metrics
+metrics_log.json
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

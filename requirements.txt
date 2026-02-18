@@ -1,0 +1,30 @@
+fastapi
+uvicorn
+elasticsearch
+langchain
+langchain-elasticsearch
+langchain-openai
+pypdf
+python-dotenv
+streamlit>=1.42.0
+Authlib>=1.3.2
+
+# ML/AI Libraries
+sentence-transformers
+transformers
+torch
+accelerate
+
+# ⚡ GROQ API for ultra-fast generation (1-2s response!)
+groq
+# OpenRouter fallback (free models when Groq is rate-limited)
+openai
+
+# RAGAS for evaluation (optional - comment out if not using)
+ragas
+
+# Utilities
+psutil
+plotly
+pandas
+PyPDF2
