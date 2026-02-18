@@ -70,7 +70,7 @@ def _handle_logout():
         pass
     for _k in ["messages", "conversations", "current_view",
                 "last_response", "chat_draft", "docs", "doc_files", "_pending_docs_for_badge",
-                "_user_db_key", "groq_api_key", "generator", "model_loaded", "_history_loaded"]:
+                "_user_db_key", "groq_api_key", "generator", "model_loaded", "_history_loaded", "_sid_cookie_set"]:
         st.session_state.pop(_k, None)
 
 st.set_page_config(
@@ -262,6 +262,25 @@ if _sid and not st.session_state.authenticated:
     if _restore_session_from_sid(_sid):
         st.rerun()
 
+# ---------- Site band karke dubara open: cookie se sid restore (redirect to ?sid=...) ----------
+# Jab URL mein sid nahi but browser mein cookie hai to redirect karke session restore karo; logout tak key na maange.
+if not st.session_state.authenticated and not _sid:
+    # Logout ke baad cookie hata do taaki dobara open pe key maange
+    if st.session_state.get("_just_logged_out"):
+        components.html('<script>document.cookie = "elastic_sid=; path=/; max-age=0";</script>', height=0)
+        st.session_state["_just_logged_out"] = False
+    _cookie_restore_html = """
+    <script>
+    (function() {
+        var m = document.cookie.match(/elastic_sid=([^;]+)/);
+        if (m && !window.location.search.includes('sid=')) {
+            window.location.replace(window.location.pathname + '?sid=' + encodeURIComponent(m[1].trim()));
+        }
+    })();
+    </script>
+    """
+    components.html(_cookie_restore_html, height=0)
+
 # ---------- Login only via Groq API key: key = auth, site detects account via key ----------
 if not st.session_state.authenticated:
     st.markdown("""
@@ -357,6 +376,19 @@ if False and not _user_groq:  # dead: key-only login
     st.markdown("[Create API key at Groq Console →](https://console.groq.com/keys)")
     st.caption("You won’t get access to the app until a key is saved for your account.")
     st.stop()
+
+# Login ke baad sid ko cookie mein daalo: site band karke dubara open karne par bhi session restore ho
+try:
+    _qsid = st.query_params.get("sid") if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
+    if st.session_state.get("authenticated") and _qsid and not st.session_state.get("_sid_cookie_set"):
+        _safe_sid = _qsid.replace("\\", "\\\\").replace('"', '\\"')[:64]
+        components.html(
+            f'<script>document.cookie = "elastic_sid={_safe_sid}; path=/; max-age=7776000; SameSite=Lax";</script>',
+            height=0
+        )
+        st.session_state["_sid_cookie_set"] = True
+except Exception:
+    pass
 
 # Ensure Groq key in session (set at login; or from saved user / env)
 if "groq_api_key" not in st.session_state or not (st.session_state.get("groq_api_key") or "").strip():
