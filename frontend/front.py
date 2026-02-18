@@ -49,12 +49,14 @@ def _handle_logout():
     st.session_state.auth_provider = None
     st.session_state["_just_logged_out"] = True
     try:
-        load_generator.clear()
+        _lg = globals().get("load_generator")
+        if _lg is not None:
+            _lg.clear()
     except Exception:
         pass
     for _k in ["messages", "conversations", "current_view",
                 "last_response", "chat_draft", "docs", "doc_files", "_pending_docs_for_badge",
-                "_user_db_key", "groq_api_key", "generator", "model_loaded"]:
+                "_user_db_key", "groq_api_key", "generator", "model_loaded", "_history_loaded"]:
         st.session_state.pop(_k, None)
 
 st.set_page_config(
@@ -178,6 +180,27 @@ def _save_user_groq_key(api_key: str):
     return True
 
 
+def _load_user_history() -> dict:
+    """Load saved conversation history for the current user (if any)."""
+    db_key = _get_current_user_db_key()
+    if not db_key:
+        return {}
+    users = _load_users()
+    return (users.get(db_key) or {}).get("history", {}) or {}
+
+
+def _save_user_history():
+    """Persist current user's conversations to disk so history survives refresh/restart."""
+    db_key = _get_current_user_db_key()
+    if not db_key:
+        return
+    users = _load_users()
+    if db_key not in users:
+        users[db_key] = {}
+    users[db_key]["history"] = st.session_state.get("conversations", {}) or {}
+    _save_users(users)
+
+
 # ---------- Login only via Groq API key: key = auth, site detects account via key ----------
 if not st.session_state.authenticated:
     st.markdown("""
@@ -265,6 +288,24 @@ if False and not _user_groq:  # dead: key-only login
 if "groq_api_key" not in st.session_state or not (st.session_state.get("groq_api_key") or "").strip():
     st.session_state.groq_api_key = _get_user_groq_key() or os.getenv("GROQ_API_KEY", "")
 
+# Load per-user conversation history once per session, so refresh / restart ke baad bhi
+# account ke sath chats wapas aa sakein.
+if st.session_state.get("authenticated") and not st.session_state.get("_history_loaded"):
+    saved_history = _load_user_history()
+    if saved_history:
+        st.session_state.conversations = saved_history
+        # Default to last conversation as active
+        try:
+            last_id = list(saved_history.keys())[-1]
+            st.session_state.conversation_id = last_id
+            conv = saved_history.get(last_id, {})
+            st.session_state.messages = conv.get("messages", []).copy()
+            st.session_state.docs = list(conv.get("docs", []))
+            st.session_state.doc_files = dict(conv.get("doc_files", {}))
+        except Exception:
+            pass
+    st.session_state["_history_loaded"] = True
+
 # Groq session sync: Jab tak Groq account login hai tab tak site login. Groq se logout/revoke = site se auto logout.
 # Key ko periodically validate karte hain; invalid (revoke ya Groq logout) hone par session clear → user ko dubara key dalni padegi.
 if st.session_state.get("authenticated") and st.session_state.get("auth_provider") == "groq":
@@ -291,7 +332,9 @@ if st.session_state.get("authenticated") and st.session_state.get("auth_provider
                 for _k in ["messages", "conversations", "current_view", "last_response", "chat_draft", "docs", "doc_files", "_pending_docs_for_badge", "_groq_key_last_validated"]:
                     st.session_state.pop(_k, None)
                 try:
-                    load_generator.clear()
+                    _lg = globals().get("load_generator")
+                    if _lg is not None:
+                        _lg.clear()
                 except Exception:
                     pass
                 st.rerun()
@@ -896,7 +939,7 @@ def init():
         "last_response": None, "metrics_history": [], "show_upload": False,
         "conversation_id": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "conversations": {}, "enable_history": True, "model_loaded": False,
-        "_runtime_version": None,
+        "_runtime_version": None, "_history_loaded": False,
         "auth_provider": None,
         "current_view": "chat", "rename_conversation": None, "sidebar_open": True
     }
@@ -978,6 +1021,7 @@ with menu_col:
                     "docs": list(st.session_state.get("docs", [])),
                     "doc_files": dict(st.session_state.get("doc_files", {})),
                 }
+                _save_user_history()
             st.session_state.messages = []
             st.session_state.docs = []
             st.session_state.doc_files = {}
@@ -1055,6 +1099,7 @@ elif st.session_state.current_view == "history":
                 "docs": list(st.session_state.get("docs", [])),
                 "doc_files": dict(st.session_state.get("doc_files", {})),
             }
+            _save_user_history()
         st.session_state.messages = []
         st.session_state.docs = []
         st.session_state.doc_files = {}
@@ -1591,6 +1636,15 @@ else:
                         )
                         st.session_state.messages.append({"role": "assistant", "content": answer})
                         st.session_state.last_response = {**metrics, "results": results}
+
+                        # Har successful answer ke baad current conversation ko per-user history mein save karo
+                        st.session_state.conversations[st.session_state.conversation_id] = {
+                            "messages": st.session_state.messages.copy(),
+                            "title": st.session_state.messages[0]['content'][:40] + "..." if st.session_state.messages else "New Chat",
+                            "docs": list(st.session_state.get("docs", [])),
+                            "doc_files": dict(st.session_state.get("doc_files", {})),
+                        }
+                        _save_user_history()
 
             except Exception as e:
                 error = f"❌ Error: {e}"
