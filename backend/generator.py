@@ -194,29 +194,16 @@ Answer helpfully from the context above.<|im_end|>
         
         if not has_content:
             return "The retrieved documents are empty. Please check your uploaded files."
-        
-        if not GROQ_API_KEY:
+
+        # Groq client should already be initialized with the per-user key (passed from Streamlit).
+        # If for some reason it's missing, ask the user to sign in again rather than editing .env.
+        if self.groq_client is None:
             return (
-                "**Add your Groq API key to get answers.**\n\n"
-                "1. Click **Get Groq API Key** in the sidebar (or go to https://console.groq.com/keys)\n"
-                "2. Create your key (free)\n"
-                "3. In `.env` add: `GROQ_API_KEY=your_key_here`\n"
-                "4. Restart the app."
+                "**Groq API client is not initialized.**\n\n"
+                "Please sign out from the app and sign in again with your Groq API key."
             )
-        
-        if self.groq_client is None and GROQ_API_KEY:
-            try:
-                from groq import Groq
-                self.groq_client = Groq(api_key=GROQ_API_KEY)
-            except Exception:
-                pass
-        if self.groq_client is not None:
-            return self._generate_with_groq(query, docs, history)
-        
-        return (
-            "**Groq API could not be used.** Check your `GROQ_API_KEY` in `.env` and restart. "
-            "Get key: https://console.groq.com/keys"
-        )
+
+        return self._generate_with_groq(query, docs, history)
 
     def _build_api_messages(self, query: str, docs: List[Union[str, Dict[str, Any]]], history: str = ""):
         """Build (messages, is_summary_question) for Groq/OpenRouter. Shared by both APIs."""
@@ -382,11 +369,8 @@ Summarize this document covering EVERY distinct topic you find. Don't skip any s
         """Not used when Groq-only; kept for reference."""
         if self.tokenizer is None or self.model is None:
             return (
-                "**Add your Groq API key to get answers.**\n\n"
-                "1. Click **Get Groq API Key** in the sidebar or go to https://console.groq.com/keys\n"
-                "2. Create your key (free)\n"
-                "3. In `.env` add: `GROQ_API_KEY=your_key_here`\n"
-                "4. Restart the app."
+                "**This app is configured for Groq API only.**\n\n"
+                "If you're seeing this message, please sign in again with your Groq API key."
             )
         
         prompt = self.build_prompt(query, docs, history)
