@@ -526,47 +526,108 @@ if not st.session_state.authenticated and not _sid and not _code:
 
 # ---------- Login only via Groq API key: key = auth, site detects account via key ----------
 if not st.session_state.authenticated:
+    _auth_logo_path = os.path.join(os.path.dirname(__file__), "static", "logo.png")
+    _auth_logo_alt = os.path.join(os.path.dirname(__file__), "static", "elasticnode-logo.png")
+    _logo_b64 = None
+    if os.path.exists(_auth_logo_path):
+        try:
+            with open(_auth_logo_path, "rb") as _f:
+                _logo_b64 = base64.b64encode(_f.read()).decode()
+        except Exception:
+            pass
+    if _logo_b64 is None and os.path.exists(_auth_logo_alt):
+        try:
+            with open(_auth_logo_alt, "rb") as _f:
+                _logo_b64 = base64.b64encode(_f.read()).decode()
+        except Exception:
+            pass
+    _logo_img = ('<img src="data:image/png;base64,' + _logo_b64 + '" alt="ElasticNode AI" class="auth-logo" style="cursor:pointer;">') if _logo_b64 else '<div class="auth-logo" style="font-size: 3rem; margin-bottom: 2rem; cursor: pointer;">🤖</div>'
+
     st.markdown("""
     <style>
-    * { font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@700&display=swap');
+    * { margin: 0; padding: 0; box-sizing: border-box; }
     #MainMenu, footer, header { visibility: hidden; }
     .stDeployButton { display: none; }
     section[data-testid="stSidebar"] { display: none !important; }
-    html, body, [data-testid="stAppViewContainer"] { margin: 0; padding: 0; min-height: 100vh; background: #fafafa !important; }
-    .main { background: #fafafa !important; padding: 0 !important; }
-    .block-container { padding: 2rem 1.5rem !important; max-width: 420px !important; margin: 0 auto !important; }
-    .auth-card { text-align: center; padding: 0.5rem 0; }
-    .auth-title { font-size: 1.25rem; font-weight: 700; color: #1a1a1a; margin-bottom: 0.25rem; }
-    .auth-subtitle { color: #737373; font-size: 0.875rem; margin-bottom: 0.5rem; }
-    .stTextInput > div > div > input { border: 1px solid #e5e5e5 !important; border-radius: 8px !important; font-size: 0.9375rem !important; }
-    .stButton > button { border-radius: 8px !important; font-weight: 600 !important; }
+    html, body, [data-testid="stAppViewContainer"] { height: 100vh; overflow: hidden; background: white; }
+    .main { padding: 0 !important; height: 100vh; }
+    .block-container { padding: 0 !important; max-width: 100% !important; height: 100vh; }
+    div[data-testid="column"] { height: 100vh; }
+    .auth-left { flex: 1; background: linear-gradient(135deg, #8B5CF6, #EC4899, #EF4444, #3B82F6); background-size: 300% 300%; animation: gradientSwipe 10s ease infinite; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 3rem; position: relative; overflow: hidden; min-height: 100vh; }
+    @keyframes gradientSwipe { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
+    .auth-left::before { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: radial-gradient(circle at 30% 50%, rgba(255,255,255,0.1) 0%, transparent 50%); pointer-events: none; }
+    .auth-brand { position: relative; z-index: 1; text-align: center; max-width: 500px; }
+    .auth-label { font-size: 0.75rem; color: rgba(255,255,255,0.7); letter-spacing: 2px; text-transform: uppercase; margin-bottom: 2rem; font-weight: 500; -webkit-font-smoothing: antialiased; }
+    .auth-logo { width: 280px; height: auto; margin: 0 auto 2rem; display: block; filter: drop-shadow(0 10px 30px rgba(0,0,0,0.3)); }
+    .auth-heading { font-size: 2.5rem; font-weight: 700; color: white; line-height: 1.2; margin-bottom: 1rem; text-shadow: 0 2px 10px rgba(0,0,0,0.2); max-width: 400px; margin-left: auto; margin-right: auto; -webkit-font-smoothing: antialiased; }
+    .auth-subheading { font-size: 1rem; color: rgba(255,255,255,0.8); line-height: 1.6; max-width: 360px; margin: 0 auto; -webkit-font-smoothing: antialiased; }
+    .auth-right-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 3rem; min-height: 100vh; animation: fadeInUp 0.6s ease 0.2s both; }
+    @keyframes fadeInUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+    .auth-top-right { position: absolute; top: 2rem; right: 2rem; font-size: 0.875rem; color: #6B7280; font-weight: 500; }
+    .auth-form-container { width: 100%; max-width: 400px; }
+    .auth-form-heading { font-family: 'Playfair Display', Georgia, serif; font-size: 2.25rem; font-weight: 700; color: #111827; margin-bottom: 0.5rem; -webkit-font-smoothing: antialiased; }
+    .auth-form-subtitle { font-size: 0.875rem; color: #6B7280; margin-bottom: 2rem; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+    .auth-btn-google-wrap .stLinkButton { width: 100% !important; }
+    .auth-btn-google-wrap .stLinkButton > a { width: 100% !important; padding: 0.875rem 1.5rem !important; font-size: 0.9375rem !important; font-weight: 500 !important; color: #111827 !important; background: white !important; border: 1px solid #E5E7EB !important; border-radius: 8px !important; display: flex !important; align-items: center !important; justify-content: center !important; gap: 0.75rem !important; text-decoration: none !important; transition: all 0.2s !important; }
+    .auth-btn-google-wrap .stLinkButton > a:hover { background: #F9FAFB !important; border-color: #D1D5DB !important; }
+    @media (max-width: 768px) { div[data-testid="column"] { height: auto !important; min-height: auto !important; } .auth-left { min-height: 40vh; padding: 2rem; } .auth-logo { width: 200px !important; } .auth-heading { font-size: 1.75rem !important; } .auth-form-heading { font-size: 1.875rem !important; } .auth-right-wrap { min-height: auto; padding: 2rem 1.5rem; } }
+    @media (max-width: 640px) { .auth-left { min-height: 35vh; padding: 1.5rem; } .auth-logo { width: 180px !important; } .auth-heading { font-size: 1.5rem !important; } .auth-subheading { font-size: 0.875rem !important; } }
     </style>
     """, unsafe_allow_html=True)
-    st.markdown("""
-    <div class="auth-card">
-        <div style="font-size: 2rem; margin-bottom: 0.25rem;">🤖</div>
-        <div class="auth-title">Sign in with Google</div>
-        <div class="auth-subtitle">One click. Instant access to your AI-powered docs.</div>
+
+    _left_html = """
+    <div class="auth-left">
+        <div class="auth-brand">
+            <div class="auth-label">ELASTICNODE AI</div>
+            """ + _logo_img + """
+            <h1 class="auth-heading">Your Intelligent Document Assistant</h1>
+            <p class="auth-subheading">Powered by Hybrid Search + AI</p>
+        </div>
     </div>
-    """, unsafe_allow_html=True)
-    if st.session_state.get("auth_error"):
-        st.error(st.session_state.auth_error)
-        st.session_state.auth_error = None
-    auth_config = _get_google_auth_config()
-    if not auth_config:
-        st.warning(
-            "Google OAuth is not configured. "
-            "**Local:** Add `[auth]` with client_id, client_secret, redirect_uri in `.streamlit/secrets.toml` or in `.env` as GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI. "
-            "**Streamlit Cloud:** In your app → Settings → Secrets, paste the same TOML (see secrets.toml.example). Set redirect_uri to your app URL + `/oauth2callback`."
-        )
-        st.caption("Create OAuth credentials at Google Cloud Console → APIs & Services → Credentials.")
-        st.stop()
-    auth_url, _ = _google_oauth_login_url()
-    if auth_url:
-        st.link_button("Sign in with Google", auth_url, type="primary", use_container_width=True)
-        st.caption("You will be redirected to Google to sign in. Session persists across refresh and browser close.")
-    else:
-        st.error("Could not generate Google login URL. Check redirect_uri in secrets.")
+    """
+    _right_header_html = """
+    <div class="auth-right-wrap" style="position: relative;">
+        <div class="auth-top-right">ElasticNode</div>
+        <div class="auth-form-container">
+            <h2 class="auth-form-heading">Welcome Back</h2>
+            <p class="auth-form-subtitle">Sign in with Google to access your AI-powered document assistant.</p>
+        </div>
+    </div>
+    """
+    _or_divider_html = """
+    <div style="display: flex; align-items: center; margin: 1.5rem 0; color: #9CA3AF; font-size: 0.875rem;">
+        <span style="flex: 1; border-top: 1px solid #E5E7EB;"></span>
+        <span style="padding: 0 1rem;">OR</span>
+        <span style="flex: 1; border-top: 1px solid #E5E7EB;"></span>
+    </div>
+    """
+
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        st.markdown(_left_html, unsafe_allow_html=True)
+    with _c2:
+        st.markdown(_right_header_html, unsafe_allow_html=True)
+        if st.session_state.get("auth_error"):
+            st.error(st.session_state.auth_error)
+            st.session_state.auth_error = None
+        auth_config = _get_google_auth_config()
+        if not auth_config:
+            st.warning(
+                "Google OAuth is not configured. "
+                "**Local:** Add `[auth]` with client_id, client_secret, redirect_uri in `.streamlit/secrets.toml` or in `.env` as GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI. "
+                "**Streamlit Cloud:** In your app → Settings → Secrets, paste the same TOML (see secrets.toml.example). Set redirect_uri to your app URL + `/oauth2callback`."
+            )
+            st.caption("Create OAuth credentials at Google Cloud Console → APIs & Services → Credentials.")
+            st.stop()
+        auth_url, _ = _google_oauth_login_url()
+        if auth_url:
+            st.markdown(_or_divider_html, unsafe_allow_html=True)
+            st.markdown('<div class="auth-btn-google-wrap">', unsafe_allow_html=True)
+            st.link_button("Sign in with Google", auth_url, type="secondary", use_container_width=True)
+            st.caption("You will be redirected to Google to sign in. Session persists across refresh and browser close.")
+        else:
+            st.error("Could not generate Google login URL. Check redirect_uri in secrets.")
     st.stop()
 
 # Login ke baad sid cookie set (top window + Secure): site band/reopen pe bhi session restore
