@@ -8,6 +8,13 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
+# Load .env from project root so GOOGLE_CLIENT_ID etc. are available for auth fallback
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+except Exception:
+    pass
+
 import streamlit as st
 from streamlit.errors import StreamlitAuthError
 import streamlit.components.v1 as components
@@ -269,18 +276,31 @@ def _restore_session_from_sid(sid: str) -> bool:
 
 
 def _get_google_auth_config():
-    """Return auth config from secrets or None if not configured."""
+    """Return auth config from secrets.toml or .env, or None if not configured."""
     try:
         auth = st.secrets.get("auth", {})
         if isinstance(auth, dict) and auth.get("client_id") and auth.get("client_secret"):
             return {
                 "client_id": auth["client_id"],
                 "client_secret": auth["client_secret"],
-                "redirect_uri": auth.get("redirect_uri", ""),
+                "redirect_uri": auth.get("redirect_uri") or "http://localhost:8501/oauth2callback",
                 "server_metadata_url": auth.get("server_metadata_url", "https://accounts.google.com/.well-known/openid-configuration"),
             }
     except Exception:
         pass
+    # Fallback: .env (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI)
+    cid = os.environ.get("GOOGLE_CLIENT_ID")
+    csec = os.environ.get("GOOGLE_CLIENT_SECRET")
+    if cid and csec:
+        redirect = os.environ.get("REDIRECT_URI", "http://localhost:8501/oauth2callback")
+        if redirect and "/oauth2callback" not in redirect:
+            redirect = redirect.rstrip("/") + "/oauth2callback"
+        return {
+            "client_id": cid,
+            "client_secret": csec,
+            "redirect_uri": redirect,
+            "server_metadata_url": "https://accounts.google.com/.well-known/openid-configuration",
+        }
     return None
 
 

@@ -6,6 +6,7 @@ __pycache__/
 # Secrets & Environment
 .env
 .streamlit/secrets.toml
+frontend/.streamlit/secrets.toml
 frontend/.session_store.json
 
 # Local Data/Database
