@@ -26,6 +26,19 @@ import time
 import pandas as pd
 import plotly.express as px
 
+# Streamlit Cloud: secrets TOML is in st.secrets; backend uses os.getenv(). Copy so backend gets ELASTIC_* and USE_GROQ_API.
+def _env_from_secrets():
+    for key in ("ELASTIC_URL", "ELASTIC_API_KEY", "USE_GROQ_API", "GROQ_API_KEY"):
+        if os.environ.get(key):
+            continue
+        try:
+            val = st.secrets.get(key) or getattr(st.secrets, key, None)
+            if val:
+                os.environ[key] = str(val)
+        except Exception:
+            pass
+_env_from_secrets()
+
 # Reload backend modules so code fixes apply without full process restart.
 # Only class definitions are reloaded; heavy model weights load in __init__() only.
 for _mn in ['backend.hybrid_search', 'backend.bulk_ingest', 'backend.generator']:
@@ -276,19 +289,43 @@ def _restore_session_from_sid(sid: str) -> bool:
 
 
 def _get_google_auth_config():
-    """Return auth config from secrets.toml or .env, or None if not configured."""
+    """Return auth config from secrets.toml (or Streamlit Cloud Secrets) or .env, or None if not configured."""
+    def _get(obj, key, default=""):
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default) or default
+        val = getattr(obj, key, None)
+        if val is None:
+            try:
+                val = obj[key]
+            except (KeyError, TypeError, AttributeError):
+                pass
+        return (val or default) if val is not None else default
+
+    # 1) Streamlit Cloud / secrets.toml — st.secrets.auth.client_id style (most reliable on Cloud)
     try:
-        auth = st.secrets.get("auth", {})
-        if isinstance(auth, dict) and auth.get("client_id") and auth.get("client_secret"):
-            return {
-                "client_id": auth["client_id"],
-                "client_secret": auth["client_secret"],
-                "redirect_uri": auth.get("redirect_uri") or "http://localhost:8501/oauth2callback",
-                "server_metadata_url": auth.get("server_metadata_url", "https://accounts.google.com/.well-known/openid-configuration"),
-            }
+        auth = getattr(st.secrets, "auth", None)
+        if auth is None:
+            auth = st.secrets.get("auth") if hasattr(st.secrets, "get") else None
+        if auth is None:
+            auth = st.secrets["auth"]
+        if auth:
+            cid = _get(auth, "client_id")
+            csec = _get(auth, "client_secret")
+            if cid and csec:
+                redirect = _get(auth, "redirect_uri") or "http://localhost:8501/oauth2callback"
+                meta = _get(auth, "server_metadata_url") or "https://accounts.google.com/.well-known/openid-configuration"
+                return {
+                    "client_id": str(cid).strip(),
+                    "client_secret": str(csec).strip(),
+                    "redirect_uri": str(redirect).strip(),
+                    "server_metadata_url": str(meta).strip(),
+                }
     except Exception:
         pass
-    # Fallback: .env (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI)
+
+    # 2) Fallback: .env (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI) — local only
     cid = os.environ.get("GOOGLE_CLIENT_ID")
     csec = os.environ.get("GOOGLE_CLIENT_SECRET")
     if cid and csec:
@@ -517,7 +554,11 @@ if not st.session_state.authenticated:
         st.session_state.auth_error = None
     auth_config = _get_google_auth_config()
     if not auth_config:
-        st.warning("Google OAuth is not configured. Add `[auth]` with client_id, client_secret, redirect_uri in `.streamlit/secrets.toml` (see secrets.toml.example).")
+        st.warning(
+            "Google OAuth is not configured. "
+            "**Local:** Add `[auth]` with client_id, client_secret, redirect_uri in `.streamlit/secrets.toml` or in `.env` as GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI. "
+            "**Streamlit Cloud:** In your app → Settings → Secrets, paste the same TOML (see secrets.toml.example). Set redirect_uri to your app URL + `/oauth2callback`."
+        )
         st.caption("Create OAuth credentials at Google Cloud Console → APIs & Services → Credentials.")
         st.stop()
     auth_url, _ = _google_oauth_login_url()
