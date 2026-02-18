@@ -1,6 +1,7 @@
 import sys, os, importlib
 import base64
 import hashlib
+import secrets
 
 # Ensure project root is on sys.path so `backend.*` imports work both locally and on Streamlit Cloud.
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -43,6 +44,19 @@ if "google_intent" not in st.session_state:
 
 def _handle_logout():
     """Callback — runs BEFORE the next rerun when Logout is clicked."""
+    try:
+        _sid = st.query_params.get("sid") if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
+        if _sid:
+            store = _load_session_store()
+            store.pop(_sid, None)
+            _save_session_store(store)
+        try:
+            if hasattr(st, "query_params") and hasattr(st.query_params, "clear"):
+                st.query_params.clear()
+        except Exception:
+            pass
+    except Exception:
+        pass
     st.session_state.authenticated = False
     st.session_state.username = None
     st.session_state.show_signup = False
@@ -67,6 +81,8 @@ st.set_page_config(
 )
 
 USER_DB = os.path.join(os.path.dirname(__file__), "users.json")
+# Session store: sid -> {groq_api_key, _user_db_key, username}. Refresh pe URL se sid milne par session restore.
+SESSION_STORE_PATH = os.path.join(os.path.dirname(__file__), ".session_store.json")
 
 def _load_users():
     if os.path.exists(USER_DB):
@@ -201,6 +217,51 @@ def _save_user_history():
     _save_users(users)
 
 
+def _load_session_store():
+    """Load sid -> {groq_api_key, _user_db_key, username} from file."""
+    if not os.path.exists(SESSION_STORE_PATH):
+        return {}
+    try:
+        with open(SESSION_STORE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_session_store(store: dict):
+    """Save session store to file."""
+    try:
+        with open(SESSION_STORE_PATH, "w", encoding="utf-8") as f:
+            json.dump(store, f)
+    except Exception:
+        pass
+
+
+def _restore_session_from_sid(sid: str) -> bool:
+    """If sid is valid, restore session state and return True."""
+    if not (sid or "").strip():
+        return False
+    store = _load_session_store()
+    data = store.get((sid or "").strip())
+    if not data or not data.get("groq_api_key"):
+        return False
+    st.session_state.authenticated = True
+    st.session_state.groq_api_key = data.get("groq_api_key", "")
+    st.session_state.auth_provider = "groq"
+    st.session_state._user_db_key = data.get("_user_db_key", "")
+    st.session_state.username = data.get("username", "Groq User")
+    return True
+
+
+# ---------- Refresh pe session restore: URL mein sid ho to file se session bhar do ----------
+try:
+    _sid = st.query_params.get("sid") if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
+except Exception:
+    _sid = None
+if _sid and not st.session_state.authenticated:
+    if _restore_session_from_sid(_sid):
+        st.rerun()
+
 # ---------- Login only via Groq API key: key = auth, site detects account via key ----------
 if not st.session_state.authenticated:
     st.markdown("""
@@ -242,6 +303,19 @@ if not st.session_state.authenticated:
                 st.session_state.username = "Groq " + _groq_key_fingerprint(key_val) if _groq_key_fingerprint(key_val) else "Groq User"
                 st.session_state._user_db_key = hashlib.sha256(key_val.encode()).hexdigest()[:16]
                 _save_user_groq_key(key_val)
+                # Refresh pe dubara key na maangne: sid URL mein + file mein save
+                sid = secrets.token_urlsafe(16)
+                store = _load_session_store()
+                store[sid] = {
+                    "groq_api_key": key_val,
+                    "_user_db_key": st.session_state._user_db_key,
+                    "username": st.session_state.username,
+                }
+                _save_session_store(store)
+                try:
+                    st.query_params["sid"] = sid
+                except Exception:
+                    pass
                 st.success("Signed in. Loading app...")
                 time.sleep(0.5)
                 st.rerun()
