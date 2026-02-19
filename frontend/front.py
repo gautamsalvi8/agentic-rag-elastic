@@ -203,6 +203,26 @@ def _email_user_exists(email: str) -> bool:
     return key in users
 
 
+def _find_db_key_by_username(username: str):
+    """Groq_email user jiska username match kare uska db_key return karo, warna None."""
+    if not (username or "").strip():
+        return None
+    uname = (username or "").strip().lower()
+    users = _load_users()
+    for k, v in (users or {}).items():
+        if not isinstance(v, dict) or v.get("provider") != "groq_email":
+            continue
+        u = (v.get("username") or "").strip().lower()
+        if u == uname:
+            return k
+    return None
+
+
+def _username_exists(username: str) -> bool:
+    """Signup ke liye: ye username pehle se kisi groq_email account mein hai ya nahi."""
+    return _find_db_key_by_username(username) is not None
+
+
 def _login_email_groq(email: str, api_key: str) -> tuple:
     """Email + Groq API key se login. Returns (True, username, db_key) ya (False, error_msg)."""
     email = (email or "").strip().lower()
@@ -225,6 +245,30 @@ def _login_email_groq(email: str, api_key: str) -> tuple:
         return False, "This API key doesn't match the one used for this account. Use the same key you used when signing up."
     username = (user.get("username") or email.split("@")[0] or "User").strip()
     return True, username, db_key
+
+
+def _login_username_groq(username: str, api_key: str) -> tuple:
+    """Username + Groq API key se login. Returns (True, username, db_key) ya (False, error_msg)."""
+    username = (username or "").strip()
+    api_key = (api_key or "").strip()
+    if not username:
+        return False, "Please enter your username."
+    if not api_key or not api_key.startswith("gsk_") or len(api_key) <= 30:
+        return False, "Please enter a valid Groq API key (same key you used when creating account)."
+    db_key = _find_db_key_by_username(username)
+    if not db_key:
+        return False, "No account found with this username. Please sign up first."
+    ok, err = _validate_groq_api_key(api_key)
+    if not ok:
+        return False, err or "Invalid API key."
+    users = _load_users()
+    user = users.get(db_key) or {}
+    stored_enc = (user.get("groq_api_key") or "").strip()
+    stored_key = _decrypt_api_key(stored_enc)
+    if (stored_key or "").strip() != api_key:
+        return False, "This API key doesn't match this account. Use the same key you used when signing up."
+    display_name = (user.get("username") or username or "User").strip()
+    return True, display_name, db_key
 
 
 def _validate_groq_api_key(api_key: str) -> tuple:
@@ -270,6 +314,15 @@ def _get_user_groq_key():
     users = _load_users()
     stored = (users.get(key) or {}).get("groq_api_key") or ""
     return _decrypt_api_key(stored)
+
+
+def _set_groq_key_from_db_on_restore():
+    """After sid restore, groq user ka key session me set karo (users.json se)."""
+    if st.session_state.get("auth_provider") != "groq":
+        return
+    key = _get_user_groq_key()
+    if key:
+        st.session_state.groq_api_key = key
 
 
 def _save_user_groq_key(api_key: str):
@@ -434,6 +487,7 @@ def _restore_session_from_sid(sid: str) -> bool:
         st.session_state.auth_provider = data.get("p", "google")
         st.session_state._user_db_key = data.get("k", "")
         st.session_state.username = data.get("u", "User")
+        _set_groq_key_from_db_on_restore()
         return True
     store = _load_session_store()
     data = store.get(sid)
@@ -446,6 +500,8 @@ def _restore_session_from_sid(sid: str) -> bool:
     st.session_state.username = data.get("username", "User")
     if data.get("groq_api_key"):
         st.session_state.groq_api_key = data.get("groq_api_key", "")
+    else:
+        _set_groq_key_from_db_on_restore()
     return True
 
 
@@ -590,15 +646,38 @@ def _google_oauth_callback(code: str, state: str) -> dict:
 # ---------- Query params: OAuth callback, sid restore, then API keys from localStorage (restore_groq/restore_hf) ----------
 try:
     _qp = st.query_params if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
-    _sid = _qp.get("sid") if _qp else None
-    _code = _qp.get("code") if _qp else None
-    _state = _qp.get("state") if _qp else None
-    _restore_groq = _qp.get("restore_groq") if _qp else None
-    _restore_hf = _qp.get("restore_hf") if _qp else None
+    def _one(v):
+        if v is None: return None
+        if isinstance(v, (list, tuple)): return (v[0] if v else None)
+        return v
+    _sid_raw = _qp.get("sid") if _qp else None
+    _sid = (_one(_sid_raw) or "").strip() or None
+    _code = _one(_qp.get("code")) if _qp else None
+    _state = _one(_qp.get("state")) if _qp else None
+    _restore_groq = _one(_qp.get("restore_groq")) if _qp else None
+    _restore_hf = _one(_qp.get("restore_hf")) if _qp else None
+    _login_username_param = _qp.get("login_username") if _qp else None
+    _login_key_param = _qp.get("login_key") if _qp else None
+    _remember_param = _qp.get("remember") if _qp else None
 except Exception:
-    _sid = _code = _state = _restore_groq = _restore_hf = None
+    _sid = _code = _state = _restore_groq = _restore_hf = _login_username_param = _login_key_param = _remember_param = None
 
 # 1) OAuth callback: Google redirected back with code & state
+# Agar pehle hi pending_sid hai (URL update nahi hua) to sid wale URL pe meta-refresh se bhejo
+if _code and _state and st.session_state.get("_oauth_pending_sid"):
+    _pending = st.session_state.get("_oauth_pending_sid", "")
+    if _pending:
+        from urllib.parse import quote
+        _safe_sid = quote(_pending, safe="")
+        _meta_url = "/?sid=" + _safe_sid
+        _meta_attr = _meta_url.replace("&", "&amp;").replace('"', "&quot;")
+        components.html(
+            '<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0;url=' + _meta_attr + '"/><title>Redirecting...</title></head><body><p>Redirecting to app...</p></body></html>',
+            height=120,
+        )
+        del st.session_state["_oauth_pending_sid"]
+        st.stop()
+
 if _code and _state and not st.session_state.authenticated:
     userinfo = _google_oauth_callback(_code, _state)
     if userinfo:
@@ -611,33 +690,28 @@ if _code and _state and not st.session_state.authenticated:
         st.session_state.auth_provider = "google"
         st.session_state.username = name or email or "User"
         st.session_state._user_db_key = db_key
-        # Signed sid — kisi store ki zaroorat nahi, kisi bhi instance pe verify ho jata hai (Cloud multi-instance fix)
+        # Sid banao — next run pe sid se restore (ya same session mein hi authenticated rahega)
         sid = _create_session_token(st.session_state.username, db_key, "google")
-        # Optional: purane store mein bhi daal do taaki cookie/sid restore bhi kaam kare
         try:
             store = _load_session_store()
             store[sid] = {"auth_provider": "google", "_user_db_key": db_key, "username": st.session_state.username}
             _save_session_store(store)
         except Exception:
             pass
+        # URL update ke liye: sid set karo, rerun. Agar URL nahi badla to next run pe meta-refresh fallback
+        st.session_state["_oauth_pending_sid"] = sid
         try:
-            _sid_js = json.dumps(sid)
-            _redirect_html = (
-                '<script>(function(){'
-                'var sid = ' + _sid_js + ';'
-                'var origin = window.location.origin || "";'
-                'var base = origin + "/";'
-                'window.top.location.replace(base + "?sid=" + encodeURIComponent(sid));'
-                '})();</script>'
-            )
-            components.html(_redirect_html, height=0)
-            st.stop()
+            st.query_params.clear()
+            st.query_params["sid"] = sid
+            time.sleep(0.2)  # Streamlit URL sync
         except Exception:
             try:
-                st.query_params.clear()
+                for k in ["code", "state"]:
+                    st.query_params.pop(k, None)
+                st.query_params["sid"] = sid
             except Exception:
                 pass
-            st.rerun()
+        st.rerun()
     else:
         st.session_state.auth_error = "Google sign-in failed. Try again."
     try:
@@ -646,7 +720,7 @@ if _code and _state and not st.session_state.authenticated:
         pass
     st.rerun()
 
-# 2) Restore session from sid (refresh or OAuth redirect)
+# 2a) Pehle sid restore — Google redirect ke baad yahi session set karta hai (signed token, backend nahi chahiye)
 if _sid and not st.session_state.authenticated:
     if _restore_session_from_sid(_sid):
         try:
@@ -654,6 +728,14 @@ if _sid and not st.session_state.authenticated:
         except Exception:
             pass
         st.rerun()
+
+# 2b) Agar already logged in hai par URL mein sid hai (same-session case), sid hatao aur main page dikhao
+if _sid and st.session_state.authenticated:
+    try:
+        st.query_params.pop("sid", None)
+    except Exception:
+        pass
+    st.rerun()
 
 # 3) Authenticated: restore API keys from localStorage (restore_groq / restore_hf in URL)
 if st.session_state.authenticated and (_restore_groq or _restore_hf):
@@ -710,6 +792,60 @@ if not st.session_state.authenticated and not _sid and not _code:
 
 # ---------- Login only via Groq API key: key = auth, site detects account via key ----------
 if not st.session_state.authenticated:
+    # Login: Username + Groq API key (?login_username=...&login_key=...). Success pe sid cookie — logout tak logged in, history preserve.
+    if _login_username_param is not None and _login_key_param is not None:
+        _lu = (_login_username_param if isinstance(_login_username_param, str) else (_login_username_param[0] if _login_username_param else "")).strip()
+        _lk = (_login_key_param if isinstance(_login_key_param, str) else (_login_key_param[0] if _login_key_param else "")).strip()
+        if _lu or _lk:
+            result = _login_username_groq(_lu, _lk)
+            if result[0] is True:
+                _, _username, _db_key = result
+                st.session_state.authenticated = True
+                st.session_state.auth_provider = "groq"
+                st.session_state.username = _username
+                st.session_state._user_db_key = _db_key
+                st.session_state.groq_api_key = _lk
+                st.session_state.auth_error = None
+                sid = _create_session_token(_username, _db_key, "groq")
+                try:
+                    store = _load_session_store()
+                    store[sid] = {"auth_provider": "groq", "_user_db_key": _db_key, "username": _username}
+                    _save_session_store(store)
+                except Exception:
+                    pass
+                # Remember me checked → long-lived cookie (logout tak logged in). Unchecked → sirf current session, browser band = logout.
+                _remember = _remember_param in (True, "1", 1, "true", "yes") or (_remember_param and str(_remember_param).strip().lower() in ("1", "true", "yes"))
+                if _remember:
+                    _safe_sid = sid.replace("\\", "\\\\").replace('"', '\\"').replace(";", "")[:512]
+                    components.html(f'<script>(function(){{var c="elastic_sid={_safe_sid}; path=/; max-age=7776000; SameSite=Lax"; try{{if(window.top.document)window.top.document.cookie=c;}}catch(e){{}} try{{document.cookie=c;}}catch(e){{}} }})();</script>', height=0)
+                _b64 = base64.urlsafe_b64encode(_lk.encode()).decode().rstrip("=")
+                _safe = _b64.replace("\\", "\\\\").replace('"', '\\"')[:256]
+                components.html(
+                    f'<script>try{{var b="{_safe}".replace(/-/g,"+").replace(/_/g,"/"); while(b.length%4) b+="="; var k=decodeURIComponent(escape(atob(b))); localStorage.setItem("elastic_groq_key",k);}}catch(e){{}}</script>',
+                    height=0,
+                )
+                try:
+                    for k in ["login_username", "login_key", "remember"]:
+                        try:
+                            st.query_params.pop(k, None)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                st.success("Logged in successfully!")
+                time.sleep(0.6)
+                st.rerun()
+            else:
+                st.session_state.auth_error = result[1]
+                try:
+                    for k in ["login_username", "login_key", "remember"]:
+                        try:
+                            st.query_params.pop(k, None)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                st.rerun()
     auth_config = _get_google_auth_config()
     if not auth_config:
         st.warning(
@@ -724,17 +860,10 @@ if not st.session_state.authenticated:
         st.error("Could not generate Google login URL. Check redirect_uri in secrets.")
         st.stop()
 
-    # redirect_uri_mismatch fix: Google Console mein yehi exact URI add karo (Copy karke)
-    _auth_cfg = _get_google_auth_config()
-    _ru = (_auth_cfg or {}).get("redirect_uri", "")
-    if _ru:
-        with st.expander("🔧 redirect_uri_mismatch? Is URI ko Google Console → Credentials → Authorized redirect URIs mein add karo"):
-            st.code(_ru, language=None)
-            st.caption("Copy the above URL and add it in Google Cloud Console if you see Error 400: redirect_uri_mismatch")
-
     _auth_error = st.session_state.get("auth_error")
     if _auth_error:
         st.session_state.auth_error = None
+    _auth_success = st.session_state.pop("signup_success_msg", None)  # show once on login page after signup
 
     _auth_static = os.path.join(os.path.dirname(__file__), "static")
     _logo_paths = [
@@ -782,51 +911,72 @@ if not st.session_state.authenticated:
     [data-testid="stHeader"], [data-testid="stToolbar"], footer { display: none !important; }
     .stDeployButton { display: none !important; }
     section[data-testid="stSidebar"] { display: none !important; }
-    html, body, [data-testid="stAppViewContainer"], .main { background: #FFFFFF !important; }
+    html, body, [data-testid="stAppViewContainer"], .main { background: #ffffff !important; }
     html, body, [data-testid="stAppViewContainer"] { height: 100vh; overflow: hidden !important; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
     .main { padding: 0 !important; height: 100vh !important; overflow: hidden !important; }
-    /* Full page: pure white */
-    .block-container { padding: 1.5rem !important; width: 100% !important; min-height: 100vh !important; display: flex !important; align-items: center !important; justify-content: center !important; background: #FFFFFF !important; }
-    /* Outer container: white, no tint, very subtle structure only */
-    .main [data-testid="stHorizontalBlock"] { width: 88% !important; max-width: 1200px !important; overflow: hidden !important; display: flex !important; flex-direction: row !important; flex-shrink: 0 !important; background: #FFFFFF !important; box-shadow: none !important; border: none !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child { flex: 0 0 320px !important; width: 320px !important; max-width: 320px !important; min-width: 0 !important; background: #FFFFFF !important; overflow: hidden !important; border: none !important; box-shadow: none !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:last-child { flex: 1 1 auto !important; min-width: 0 !important; background: #FFFFFF !important; }
-    /* Left panel: wrapper for vertical centering */
-    .left-panel { display: flex !important; flex-direction: column !important; justify-content: center !important; align-items: center !important; width: 100% !important; min-height: 100% !important; padding: 1rem !important; box-sizing: border-box !important; margin-top: 3rem !important; }
-    .left-form-wrapper { width: 320px !important; max-width: 320px !important; margin: 0 auto 12px !important; display: flex !important; flex-direction: column !important; gap: 8px !important; box-sizing: border-box !important; }
-    /* Left column: force 320px so Streamlit overrides nahi aaye — .main se specificity high */
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child > div { width: 320px !important; max-width: 320px !important; min-width: 0 !important; margin-left: auto !important; margin-right: auto !important; margin-bottom: 16px !important; box-sizing: border-box !important; overflow: hidden !important; border: none !important; box-shadow: none !important; background: transparent !important; }
+    .block-container { padding: 0 !important; width: 100% !important; min-height: 100vh !important; display: flex !important; align-items: center !important; justify-content: center !important; background: #ffffff !important; max-width: 100% !important; }
+    /* Two equal columns 50% / 50% */
+    .main [data-testid="stHorizontalBlock"] { width: 100% !important; max-width: 100% !important; overflow: hidden !important; display: flex !important; flex-direction: row !important; flex-shrink: 0 !important; background: #ffffff !important; box-shadow: none !important; border: none !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child { flex: 0 0 50% !important; width: 50% !important; max-width: 50% !important; min-width: 0 !important; min-height: 100vh !important; background: #ffffff !important; padding: 0 !important; display: flex !important; flex-direction: column !important; justify-content: center !important; align-items: center !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:last-child { flex: 0 0 50% !important; width: 50% !important; max-width: 50% !important; min-width: 0 !important; background: #ffffff !important; }
+    /* Left column content wrapper: full width/height, flex center - taaki auth card bilkul beech mein aaye */
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child > div { width: 100% !important; max-width: 100% !important; min-width: 0 !important; min-height: 100% !important; padding: 0 !important; margin: 0 !important; box-sizing: border-box !important; border: none !important; background: transparent !important; display: flex !important; flex-direction: column !important; justify-content: center !important; align-items: center !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child > div:first-of-type { box-shadow: none !important; border-radius: 0 !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child > div:not(:first-of-type):not(:last-of-type) { padding: 0 !important; border-radius: 0 !important; box-shadow: none !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child > div:last-of-type { border-radius: 0 !important; padding: 0 !important; }
     .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child > div > div { width: 100% !important; max-width: 100% !important; min-width: 0 !important; box-sizing: border-box !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child > * { width: 320px !important; max-width: 320px !important; min-width: 0 !important; box-sizing: border-box !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stVerticalBlock"] { width: 320px !important; max-width: 320px !important; min-width: 0 !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] { width: 320px !important; max-width: 320px !important; min-width: 0 !important; padding: 0 !important; overflow: hidden !important; box-sizing: border-box !important; border: none !important; box-shadow: none !important; background: transparent !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] > div { width: 320px !important; max-width: 320px !important; min-width: 0 !important; padding: 0 !important; margin: 8px 0 0 0 !important; box-sizing: border-box !important; border: none !important; box-shadow: none !important; background: transparent !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] [data-testid="stHorizontalBlock"] { width: 320px !important; max-width: 320px !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child > * { width: 100% !important; max-width: 100% !important; min-width: 0 !important; box-sizing: border-box !important; background: transparent !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stVerticalBlock"] { width: 100% !important; max-width: 100% !important; min-width: 0 !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] { width: 100% !important; max-width: 100% !important; min-width: 0 !important; padding: 0 !important; overflow: hidden !important; box-sizing: border-box !important; border: none !important; box-shadow: none !important; background: transparent !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] > div { width: 100% !important; max-width: 100% !important; min-width: 0 !important; padding: 0 !important; margin: 6px 0 0 0 !important; box-sizing: border-box !important; border: none !important; box-shadow: none !important; background: transparent !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] [data-testid="stHorizontalBlock"] { width: 100% !important; max-width: 100% !important; }
     .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stTextInput"], .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stTextInput"] > div { width: 100% !important; max-width: 100% !important; min-width: 0 !important; box-sizing: border-box !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child input { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 44px !important; border-radius: 10px !important; box-sizing: border-box !important; border: 1px solid #d1d5db !important; background: #f8fafc !important; transition: border-color 0.2s, box-shadow 0.2s !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] input { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 44px !important; border-radius: 10px !important; box-sizing: border-box !important; border: 1px solid #d1d5db !important; background: #f8fafc !important; transition: border-color 0.2s, box-shadow 0.2s !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child input { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 42px !important; border-radius: 8px !important; box-sizing: border-box !important; border: 1px solid #e5e7eb !important; background: #f8fafc !important; transition: border-color 0.2s !important; padding: 0 0.75rem !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] input { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 42px !important; border-radius: 8px !important; box-sizing: border-box !important; border: 1px solid #e5e7eb !important; background: #f8fafc !important; padding: 0 0.75rem !important; }
     .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child .stButton { width: 100% !important; max-width: 100% !important; min-width: 0 !important; box-sizing: border-box !important; }
     .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] .stButton { width: 100% !important; max-width: 100% !important; min-width: 0 !important; box-sizing: border-box !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child .stButton > button { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 44px !important; border-radius: 10px !important; box-sizing: border-box !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] .stButton > button { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 44px !important; border-radius: 10px !important; box-sizing: border-box !important; background: #1f4ed8 !important; color: #ffffff !important; border: none !important; box-shadow: 0 2px 8px rgba(31,78,216,0.25) !important; }
-    .left-form-wrapper input, .left-form-wrapper button { width: 100% !important; max-width: 100% !important; height: 44px !important; border-radius: 10px !important; box-sizing: border-box !important; }
-    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child { padding: 0 !important; display: flex !important; flex-direction: column !important; justify-content: center !important; align-items: center !important; height: 100% !important; min-height: 400px !important; }
-    .auth-split-brand { display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; gap: 0.5rem; margin: 0 0 4px 0; }
-    .auth-split-logo { max-height: 56px; width: auto; }
-    .auth-split-logo-placeholder { width: 32px; height: 28px; background: #f8fafc; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.6rem; font-weight: 600; color: #94a3b8; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child .stButton > button { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 42px !important; border-radius: 8px !important; box-sizing: border-box !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] .stButton > button { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 42px !important; border-radius: 8px !important; box-sizing: border-box !important; background: #1f4ed8 !important; color: #ffffff !important; border: none !important; box-shadow: 0 1px 3px rgba(31,78,216,0.2) !important; }
+    .left-form-wrapper input, .left-form-wrapper button { width: 100% !important; max-width: 100% !important; height: 42px !important; border-radius: 8px !important; box-sizing: border-box !important; }
+    .left-panel { display: flex !important; flex-direction: column !important; justify-content: center !important; align-items: center !important; width: 100% !important; min-height: 100% !important; padding: 0 !important; padding-top: 36px !important; box-sizing: border-box !important; margin: 0 !important; }
+    .left-form-wrapper { width: 100% !important; max-width: 100% !important; margin: 0 !important; display: flex !important; flex-direction: column !important; gap: 6px !important; box-sizing: border-box !important; }
+    .auth-split-brand { display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; gap: 0.5rem; margin: 28px 0 48px 0 !important; }
+    .auth-split-logo { max-height: 88px; width: auto; }
+    .auth-split-logo-placeholder { width: 48px; height: 42px; background: #f8fafc; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 600; color: #94a3b8; }
     .auth-split-brand-name { font-size: 1.05rem; font-weight: 700; color: #1a1a1a; letter-spacing: -0.02em; }
-    .auth-split-title { font-size: 1.25rem; font-weight: 700; color: #1a1a1a; margin: 0; letter-spacing: -0.02em; }
-    .auth-split-btn { display: inline-flex !important; align-items: center !important; justify-content: center !important; gap: 0.5rem !important; width: 100% !important; max-width: 100% !important; height: 44px !important; padding: 0 1rem !important; font-size: 14px !important; font-weight: 500 !important; border-radius: 10px !important; text-decoration: none !important; border: 1px solid #e2e8f0 !important; font-family: 'Inter', sans-serif !important; cursor: pointer !important; transition: box-shadow 0.2s !important; background: #fff !important; color: #334155 !important; margin: 0 !important; box-sizing: border-box !important; box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important; }
+    .auth-split-title { font-size: 1.25rem; font-weight: 700; color: #1a1a1a; margin: 0 0 12px 0; letter-spacing: -0.02em; }
+    .auth-split-btn { display: inline-flex !important; align-items: center !important; justify-content: center !important; gap: 0.5rem !important; width: 100% !important; max-width: 100% !important; height: 42px !important; padding: 0 0.75rem !important; font-size: 14px !important; font-weight: 500 !important; border-radius: 8px !important; text-decoration: none !important; border: 1px solid #e2e8f0 !important; font-family: 'Inter', sans-serif !important; cursor: pointer !important; transition: box-shadow 0.2s !important; background: #fff !important; color: #334155 !important; margin: 0 0 12px 0 !important; box-sizing: border-box !important; box-shadow: 0 1px 2px rgba(0,0,0,0.04) !important; }
     .auth-split-btn:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     .auth-split-btn img { width: 18px; height: 18px; flex-shrink: 0; order: -1; }
-    .auth-split-divider { display: flex; align-items: center; margin: 0; color: #94a3b8; font-size: 14px; }
+    .auth-split-divider { display: flex; align-items: center; margin: 0 0 12px 0; color: #94a3b8; font-size: 13px; }
     .auth-split-divider::before, .auth-split-divider::after { content: ''; flex: 1; height: 1px; background: #e2e8f0; }
     .auth-split-divider span { padding: 0 0.5rem; }
-    /* Right panel: pure white, image blends in — no box or tint (unchanged) */
-    [data-testid="column"]:last-child { padding: 2rem 2.5rem !important; display: flex !important; align-items: center !important; justify-content: center !important; min-height: 400px !important; }
-    .auth-split-right-panel { width: 100%; height: 100%; display: flex !important; align-items: center !important; justify-content: center !important; background: transparent !important; }
-    .auth-split-illus-wrap { width: 90% !important; max-width: 100%; display: flex; align-items: center; justify-content: center; padding: 1rem; }
-    .auth-split-illus-wrap img { width: 100%; height: auto; object-fit: contain; display: block; }
+    /* ---------- Manual login card (pure HTML, no Streamlit widgets) - change jo chaho ---------- */
+    .auth-login-card { width: 400px !important; max-width: 400px !important; margin-left: auto !important; margin-right: auto !important; margin-top: 36px !important; box-sizing: border-box !important; padding: 35px !important; border-radius: 18px !important; background: transparent !important; box-shadow: none !important; border: none !important; text-align: center !important; }
+    .auth-form-manual { display: flex !important; flex-direction: column !important; gap: 0 !important; margin: 0 !important; margin-top: 16px !important; padding: 0 !important; }
+    .auth-form-manual .auth-input { width: 100% !important; box-sizing: border-box !important; height: 45px !important; border: none !important; border-radius: 10px !important; background: #eef1f5 !important; margin-bottom: 18px !important; padding: 0 15px 0 15px !important; font-size: 14px !important; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important; }
+    .auth-form-manual .auth-input::placeholder { color: #94a3b8; }
+    .auth-form-manual .auth-input:focus { outline: none !important; box-shadow: 0 0 0 2px rgba(31,78,216,0.2); }
+    .auth-remember-forgot { display: flex !important; align-items: center !important; justify-content: space-between !important; font-size: 13px !important; margin-bottom: 18px !important; width: 100% !important; box-sizing: border-box !important; }
+    .auth-remember-label { display: inline-flex !important; align-items: center !important; gap: 8px !important; cursor: pointer !important; color: #4b5563 !important; }
+    .auth-checkbox { width: 14px !important; height: 14px !important; accent-color: #1f4ed8; cursor: pointer !important; }
+    .auth-forgot { color: #64748b !important; text-decoration: none !important; font-size: 13px !important; }
+    .auth-forgot:hover { color: #111827 !important; }
+    .auth-btn { display: inline-flex !important; align-items: center !important; justify-content: center !important; gap: 8px !important; width: 100% !important; box-sizing: border-box !important; font-family: 'Inter', sans-serif !important; cursor: pointer !important; text-decoration: none !important; border: none !important; font-size: 14px !important; font-weight: 500 !important; padding: 0 1rem !important; }
+    .auth-btn-login { height: 45px !important; border-radius: 12px !important; background: linear-gradient(180deg, #1e3a5f 0%, #0f172a 100%) !important; color: #ffffff !important; margin-top: 10px !important; margin-bottom: 0 !important; box-shadow: 0 2px 8px rgba(15,23,42,0.2) !important; }
+    .auth-btn-login:hover { opacity: 0.95; }
+    .auth-or { text-align: center !important; font-size: 13px !important; color: #94a3b8 !important; margin: 14px 0 !important; }
+    .auth-btn-google { height: 45px !important; border-radius: 12px !important; background: #f3f4f6 !important; color: #334155 !important; border: 1px solid #e5e7eb !important; }
+    .auth-btn-google:hover { background: #e5e7eb !important; }
+    .auth-btn-google img { width: 18px; height: 18px; }
+    .auth-signup { margin: 14px 0 0 0 !important; font-size: 13px !important; color: #64748b !important; text-align: center !important; }
+    .auth-signup-link { color: #1f4ed8 !important; text-decoration: none !important; font-weight: 500 !important; }
+    .auth-signup-link:hover { text-decoration: underline !important; }
+    /* Right section: image left block jitni height (logo se "Don't have an account?" tak) ke barabar, dono ek level */
+    [data-testid="column"]:last-child { padding: 1.5rem !important; display: flex !important; align-items: center !important; justify-content: center !important; min-height: 100vh !important; height: 100vh !important; background: #ffffff !important; }
+    .auth-split-right-panel { width: 100% !important; height: 100% !important; min-height: 100vh !important; display: flex !important; align-items: center !important; justify-content: center !important; background: transparent !important; }
+    .auth-split-illus-wrap { width: 90% !important; max-width: 580px !important; height: 100% !important; max-height: 90vh !important; min-height: 420px !important; display: flex !important; align-items: center !important; justify-content: center !important; padding: 0 !important; }
+    .auth-split-illus-wrap img { max-height: 100% !important; height: 100% !important; width: auto !important; max-width: 100% !important; object-fit: contain !important; display: block !important; }
     .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child input { padding: 0 1rem !important; font-size: 14px !important; }
     .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child input:focus { border-color: #1f4ed8 !important; box-shadow: 0 0 0 3px rgba(31,78,216,0.15) !important; outline: none !important; }
     .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child svg { color: #111827 !important; opacity: 0.9 !important; }
@@ -852,10 +1002,11 @@ if not st.session_state.authenticated:
         color: #111827 !important;
         opacity: 0.9 !important;
     }
-    .auth-split-signup { margin: 0; font-size: 13px; color: #64748b; text-align: center; }
+    .auth-split-signup { margin: 12px 0 0 0; font-size: 13px; color: #64748b; text-align: center; }
     .auth-split-signup a { color: #1f4ed8; text-decoration: none; font-weight: 500; }
     .auth-split-signup a:hover { text-decoration: underline; }
     .auth-split-error { background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; font-size: 0.8rem; padding: 0.5rem 0.75rem; border-radius: 10px; margin-top: 0.5rem; }
+    .auth-split-success { background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; font-size: 0.8rem; padding: 0.5rem 0.75rem; border-radius: 10px; margin-top: 0.5rem; }
     /* Custom email/password card (login container) */
     .auth-email-card { background: #f3f4f6; border-radius: 16px; padding: 1.1rem 1.25rem 1.25rem; border: 1px solid rgba(148,163,184,0.35); box-shadow: 0 4px 14px rgba(15,23,42,0.06); display: flex; flex-direction: column; gap: 10px; }
     .auth-email-input { width: 100%; height: 40px; border-radius: 10px; border: 1px solid #d1d5db; background: #f9fafb; padding: 0 1rem 0 2.25rem; font-size: 14px; box-sizing: border-box; transition: border-color 0.2s, box-shadow 0.2s, background 0.2s; }
@@ -918,60 +1069,22 @@ if not st.session_state.authenticated:
 
     with col_left:
         if _auth_view == "login":
-            # Login view: logo + Email + Groq API key form (account hai to login, nahi to "create account" message)
+            _err_block = ('<div class="auth-split-error">' + _auth_error.replace("<", "&lt;").replace(">", "&gt;") + '</div>') if _auth_error else ""
+            _success_block = ('<div class="auth-split-success">' + _auth_success.replace("<", "&lt;").replace(">", "&gt;") + '</div>') if _auth_success else ""
             st.markdown(
-                '<div class="left-panel">'
-                '<div id="auth-form-ref" class="left-form-wrapper">'
+                '<div id="auth-form-ref" class="auth-login-card">'
                 '<div class="auth-split-brand">' + _logo_html + '</div>'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            if _auth_error:
-                st.error(_auth_error)
-            with st.form("auth_login_form", clear_on_submit=False):
-                _login_email = st.text_input(
-                    "Email",
-                    placeholder="you@example.com",
-                    key="login_email",
-                    label_visibility="collapsed",
-                )
-                _login_key = st.text_input(
-                    "Groq API Key",
-                    placeholder="gsk_... (same key you used when creating account)",
-                    type="password",
-                    key="login_groq_key",
-                    label_visibility="collapsed",
-                )
-                _login_clicked = st.form_submit_button("Login")
-            if _login_clicked:
-                _le = (_login_email or "").strip().lower()
-                _lk = (_login_key or "").strip()
-                result = _login_email_groq(_le, _lk)
-                if result[0] is True:
-                    _, _username, _db_key = result
-                    st.session_state.authenticated = True
-                    st.session_state.auth_provider = "groq"
-                    st.session_state.username = _username
-                    st.session_state._user_db_key = _db_key
-                    st.session_state.groq_api_key = _lk
-                    st.session_state.auth_error = None
-                    _b64 = base64.urlsafe_b64encode(_lk.encode()).decode().rstrip("=")
-                    _safe = _b64.replace("\\", "\\\\").replace('"', '\\"')[:256]
-                    components.html(
-                        f'<script>try{{var b="{_safe}".replace(/-/g,"+").replace(/_/g,"/"); while(b.length%4) b+="="; var k=decodeURIComponent(escape(atob(b))); localStorage.setItem("elastic_groq_key",k);}}catch(e){{}}</script>',
-                        height=0,
-                    )
-                    st.success("Logged in successfully!")
-                    time.sleep(0.8)
-                    st.rerun()
-                else:
-                    st.session_state.auth_error = result[1]
-                    st.rerun()
-            st.markdown(
-                '<div class="auth-email-or">or</div>'
-                '<a href="' + _auth_url_safe + '" id="auth-google-link" class="auth-split-btn">'
-                '<img src="' + _GOOGLE_LOGO_URL + '" alt="" />Continue with Google</a>'
-                '<p class="auth-split-signup">Don\'t have an account? <a href="?view=signup">Sign Up</a></p>'
+                + _success_block + _err_block +
+                '<form method="get" action="" id="auth-login-form" class="auth-form-manual">'
+                '<input type="text" name="login_username" class="auth-input auth-input-email" placeholder="Username" autocomplete="username" />'
+                '<input type="password" name="login_key" class="auth-input auth-input-password" placeholder="Groq API key (same as signup)" autocomplete="off" />'
+                '<div class="auth-remember-forgot">'
+                '<label class="auth-remember-label"><input type="checkbox" name="remember" value="1" class="auth-checkbox" /> Remember me</label>'
+                '<a href="#" class="auth-forgot">Forgot password?</a>'
+                '</div>'
+                '<button type="submit" class="auth-btn auth-btn-login">Login</button>'
+                '</form>'
+                '<p class="auth-signup">Don\'t have an account? <a href="?view=signup" class="auth-signup-link">Sign Up</a></p>'
                 '</div>',
                 unsafe_allow_html=True,
             )
@@ -986,18 +1099,23 @@ if not st.session_state.authenticated:
             )
             with st.form("auth_signup_form", clear_on_submit=False):
                 _signup_email = st.text_input(
-                    "Email Address",
+                    "Email",
                     placeholder="you@example.com",
                     key="signup_email",
                     label_visibility="collapsed",
                 )
+                _signup_username = st.text_input(
+                    "Username",
+                    placeholder="Username (for login)",
+                    key="signup_username",
+                    label_visibility="collapsed",
+                )
                 _signup_key = st.text_input(
                     "Groq API Key",
-                    placeholder="gsk_...",
+                    placeholder="gsk_... (get at console.groq.com)",
                     type="password",
                     key="signup_groq_key",
                     label_visibility="collapsed",
-                    help="Get your free API key at console.groq.com",
                 )
                 _signup_terms = st.checkbox(
                     "I agree to Terms of Service and Privacy Policy",
@@ -1005,79 +1123,65 @@ if not st.session_state.authenticated:
                 )
                 _signup_clicked = st.form_submit_button("Create Account")
 
-            # Real-time inline validation hints (simple)
             _se = (_signup_email or "").strip()
+            _su = (_signup_username or "").strip()
             _sk = (_signup_key or "").strip()
             _email_ok = bool(_se) and "@" in _se and "." in _se.split("@")[-1]
+            _username_ok = bool(_su) and len(_su) >= 2 and all(c.isalnum() or c in "._" for c in _su)
             _key_format_ok = _sk.startswith("gsk_") and len(_sk) > 30
 
             if _se:
-                st.caption("✅ Valid email" if _email_ok else "❌ Please enter a valid email address")
+                st.caption("✅ Valid email" if _email_ok else "❌ Please enter a valid email")
+            if _su:
+                st.caption("✅ Username OK" if _username_ok else "❌ Use 2+ letters/numbers (no spaces)")
             if _sk:
-                if _key_format_ok:
-                    st.caption("✅ Key format looks correct. Will verify with Groq on submit.")
-                else:
-                    st.caption("❌ Invalid format. Groq keys start with 'gsk_' and should be long.")
+                st.caption("✅ Key format OK" if _key_format_ok else "❌ Groq keys start with 'gsk_' and are long")
 
             _signup_error_msg = ""
 
             if _signup_clicked:
-                # Step 1: email checks
                 if not _se:
                     _signup_error_msg = "Email required"
                 elif not _email_ok:
                     _signup_error_msg = "Please enter a valid email address"
-                # Step 2: API key checks
+                elif not _su:
+                    _signup_error_msg = "Username required"
+                elif not _username_ok:
+                    _signup_error_msg = "Username: 2+ characters, letters/numbers only"
+                elif _username_exists(_su):
+                    _signup_error_msg = "This username is already taken. Choose another."
                 elif not _sk:
                     _signup_error_msg = "API key required"
-                elif not _sk.startswith("gsk_"):
-                    _signup_error_msg = "Invalid format. Groq keys start with 'gsk_'."
-                elif len(_sk) <= 30:
-                    _signup_error_msg = "API key too short"
-                # Step 3: Terms
+                elif not _sk.startswith("gsk_") or len(_sk) <= 30:
+                    _signup_error_msg = "Invalid Groq API key format."
                 elif not _signup_terms:
                     _signup_error_msg = "You must agree to Terms of Service"
-                # Step 4: Email already exists?
                 elif _email_user_exists(_se):
-                    _signup_error_msg = "Account exists. Sign in instead?"
+                    _signup_error_msg = "An account with this email already exists. Sign in instead."
                 else:
-                    # Test key with Groq
                     with st.spinner("Verifying Groq API key…"):
                         _ok, _err = _validate_groq_api_key(_sk)
                     if not _ok:
                         _signup_error_msg = _err or "Invalid API key. Please check and try again."
                     else:
-                        # Save user to users.json
                         users = _load_users()
                         db_key = _email_user_key(_se)
-                        username = (_se.split("@")[0] or "user").strip()
                         users[db_key] = {
                             "provider": "groq_email",
                             "email": _se,
-                            "username": username,
+                            "username": _su.strip(),
                             "groq_api_key": _encrypt_api_key(_sk),
                             "created_at": datetime.now().isoformat(),
                         }
                         _save_users(users)
-
-                        # Auto-login user
-                        st.session_state.authenticated = True
-                        st.session_state.auth_provider = "groq"
-                        st.session_state.username = username
-                        st.session_state._user_db_key = db_key
-                        st.session_state.groq_api_key = _sk
-
-                        # Save Groq key for auto-restore (localStorage)
-                        _b64 = base64.urlsafe_b64encode(_sk.encode()).decode().rstrip("=")
-                        _safe = _b64.replace("\\", "\\\\").replace('"', '\\"')[:256]
-                        components.html(
-                            f'<script>try{{var b="{_safe}".replace(/-/g,"+").replace(/_/g,"/"); while(b.length%4) b+="="; var k=decodeURIComponent(escape(atob(b))); localStorage.setItem("elastic_groq_key",k);}}catch(e){{}}</script>',
-                            height=0,
-                        )
-
-                        st.success("Account created successfully! Redirecting to your dashboard…")
-                        st.balloons()
-                        time.sleep(1.8)
+                        st.session_state["signup_success_msg"] = "Account created! Sign in with your username and API key."
+                        st.session_state["show_signup"] = False
+                        try:
+                            st.query_params["view"] = "login"
+                        except Exception:
+                            pass
+                        st.success("Account created! Redirecting to login…")
+                        time.sleep(1.2)
                         st.rerun()
 
             if _signup_error_msg:
@@ -1107,7 +1211,6 @@ if not st.session_state.authenticated:
         '<span class="auth-loading-text">Signing in…</span>'
         '</div>'
         '<script>(function(){'
-        'var g=document.getElementById("auth-google-link"); if(g) g.addEventListener("click",function(){ document.getElementById("auth-loading-overlay").classList.add("show"); });'
         'var f=document.querySelector("form"); if(f) f.addEventListener("submit",function(){ document.getElementById("auth-loading-overlay").classList.add("show"); });'
         'function authResize(){ var ref=document.getElementById("auth-form-ref"); if(!ref) return; var w=320; ref.style.setProperty("width",w+"px","important"); ref.style.setProperty("max-width",w+"px","important"); var col=ref.closest("[data-testid=column]"); if(!col) return; col.style.setProperty("width",w+"px","important"); col.style.setProperty("max-width",w+"px","important"); for(var i=0;i<col.children.length;i++){ var ch=col.children[i]; ch.style.setProperty("width",w+"px","important"); ch.style.setProperty("max-width",w+"px","important"); } var form=col.querySelector("form")||col.querySelector("[data-testid=stForm]"); if(form){ form.style.setProperty("width",w+"px","important"); form.style.setProperty("max-width",w+"px","important"); var p=form.parentElement; while(p&&p!==col){ p.style.setProperty("width",w+"px","important"); p.style.setProperty("max-width",w+"px","important"); p=p.parentElement; } } col.querySelectorAll("input").forEach(function(inp){ inp.style.setProperty("width","100%","important"); inp.style.setProperty("max-width","100%","important"); inp.style.setProperty("box-sizing","border-box","important"); }); col.querySelectorAll(".stButton").forEach(function(btn){ btn.style.setProperty("width",w+"px","important"); btn.style.setProperty("max-width",w+"px","important"); if(btn.firstElementChild){ btn.firstElementChild.style.setProperty("width","100%","important"); btn.firstElementChild.style.setProperty("max-width","100%","important"); } }); }'
         'authResize(); setTimeout(authResize,100); setTimeout(authResize,300); setTimeout(authResize,600); setTimeout(authResize,1200); if(document.readyState!=="complete") window.addEventListener("load",function(){ authResize(); setTimeout(authResize,200); }); var col=document.querySelector("[data-testid=stHorizontalBlock] [data-testid=column]:first-child"); if(col){ var obs=new MutationObserver(function(){ authResize(); }); obs.observe(col,{childList:true,subtree:true}); }'
