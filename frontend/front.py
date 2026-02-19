@@ -203,6 +203,30 @@ def _email_user_exists(email: str) -> bool:
     return key in users
 
 
+def _login_email_groq(email: str, api_key: str) -> tuple:
+    """Email + Groq API key se login. Returns (True, username, db_key) ya (False, error_msg)."""
+    email = (email or "").strip().lower()
+    api_key = (api_key or "").strip()
+    if not email or "@" not in email:
+        return False, "Please enter a valid email address."
+    if not api_key or not api_key.startswith("gsk_") or len(api_key) <= 30:
+        return False, "Please enter a valid Groq API key (same key you used when creating account)."
+    if not _email_user_exists(email):
+        return False, "No account found with this email. Please create an account first (Sign Up)."
+    ok, err = _validate_groq_api_key(api_key)
+    if not ok:
+        return False, err or "Invalid API key."
+    users = _load_users()
+    db_key = _email_user_key(email)
+    user = users.get(db_key) or {}
+    stored_enc = (user.get("groq_api_key") or "").strip()
+    stored_key = _decrypt_api_key(stored_enc)
+    if (stored_key or "").strip() != api_key:
+        return False, "This API key doesn't match the one used for this account. Use the same key you used when signing up."
+    username = (user.get("username") or email.split("@")[0] or "User").strip()
+    return True, username, db_key
+
+
 def _validate_groq_api_key(api_key: str) -> tuple:
     """Validate Groq API key by calling Groq API. Returns (True, None) or (False, error_msg)."""
     key = (api_key or "").strip()
@@ -890,14 +914,11 @@ if not st.session_state.authenticated:
     _auth_view = "signup" if str(_auth_view).lower() == "signup" else "login"
     st.session_state.show_signup = _auth_view == "signup"
 
-    _login_clicked = False
-    _user = _pass = ""
-
     col_left, col_right = st.columns(2)
 
     with col_left:
         if _auth_view == "login":
-            # Login view: logo + custom email/password card + Google login
+            # Login view: logo + Email + Groq API key form (account hai to login, nahi to "create account" message)
             st.markdown(
                 '<div class="left-panel">'
                 '<div id="auth-form-ref" class="left-form-wrapper">'
@@ -905,24 +926,53 @@ if not st.session_state.authenticated:
                 '</div>',
                 unsafe_allow_html=True,
             )
+            if _auth_error:
+                st.error(_auth_error)
+            with st.form("auth_login_form", clear_on_submit=False):
+                _login_email = st.text_input(
+                    "Email",
+                    placeholder="you@example.com",
+                    key="login_email",
+                    label_visibility="collapsed",
+                )
+                _login_key = st.text_input(
+                    "Groq API Key",
+                    placeholder="gsk_... (same key you used when creating account)",
+                    type="password",
+                    key="login_groq_key",
+                    label_visibility="collapsed",
+                )
+                _login_clicked = st.form_submit_button("Login")
+            if _login_clicked:
+                _le = (_login_email or "").strip().lower()
+                _lk = (_login_key or "").strip()
+                result = _login_email_groq(_le, _lk)
+                if result[0] is True:
+                    _, _username, _db_key = result
+                    st.session_state.authenticated = True
+                    st.session_state.auth_provider = "groq"
+                    st.session_state.username = _username
+                    st.session_state._user_db_key = _db_key
+                    st.session_state.groq_api_key = _lk
+                    st.session_state.auth_error = None
+                    _b64 = base64.urlsafe_b64encode(_lk.encode()).decode().rstrip("=")
+                    _safe = _b64.replace("\\", "\\\\").replace('"', '\\"')[:256]
+                    components.html(
+                        f'<script>try{{var b="{_safe}".replace(/-/g,"+").replace(/_/g,"/"); while(b.length%4) b+="="; var k=decodeURIComponent(escape(atob(b))); localStorage.setItem("elastic_groq_key",k);}}catch(e){{}}</script>',
+                        height=0,
+                    )
+                    st.success("Logged in successfully!")
+                    time.sleep(0.8)
+                    st.rerun()
+                else:
+                    st.session_state.auth_error = result[1]
+                    st.rerun()
             st.markdown(
-                '<div class="left-form-wrapper">'
-                '<div class="auth-email-card">'
-                '<input type="email" class="auth-email-input auth-email-input-email" name="elastic_login_email" placeholder="Email address" autocomplete="off" />'
-                '<input type="password" class="auth-email-input auth-email-input-password" name="elastic_login_password" placeholder="Password" autocomplete="off" />'
-                '<div class="auth-email-row">'
-                '<label class="auth-email-keep"><input type="checkbox" /> Remember me</label>'
-                '<a href="' + _hash + '" class="auth-split-forgot" style="font-size:12px;color:#6b7280;">Forgot password?</a>'
-                '</div>'
-                '<button type="button" class="auth-email-login-btn">Login</button>'
-                '</div>'
                 '<div class="auth-email-or">or</div>'
                 '<a href="' + _auth_url_safe + '" id="auth-google-link" class="auth-split-btn">'
                 '<img src="' + _GOOGLE_LOGO_URL + '" alt="" />Continue with Google</a>'
-                '</div>'
-                + _error_html
-                + '<p class="auth-split-signup">Don\'t have an account? <a href="?view=signup">Sign Up</a></p>'
-                + '</div>',
+                '<p class="auth-split-signup">Don\'t have an account? <a href="?view=signup">Sign Up</a></p>'
+                '</div>',
                 unsafe_allow_html=True,
             )
         else:
@@ -1050,14 +1100,6 @@ if not st.session_state.authenticated:
             '</div></div>'
         )
         st.markdown(_right_content, unsafe_allow_html=True)
-
-    if _auth_view == "login" and _login_clicked:
-        if not (_user or "").strip() or not (_pass or "").strip():
-            st.session_state.auth_error = "Please enter email and password."
-            st.rerun()
-        else:
-            st.session_state.auth_error = None
-            st.session_state._auth_login_loading = True
 
     st.markdown(
         '<div id="auth-loading-overlay" class="auth-loading-overlay">'
