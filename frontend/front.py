@@ -2,16 +2,18 @@ import sys, os, importlib
 import base64
 import hashlib
 import secrets
+import tempfile
 
 # Ensure project root is on sys.path so `backend.*` imports work both locally and on Streamlit Cloud.
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-# Load .env from project root so GOOGLE_CLIENT_ID etc. are available for auth fallback
+# Load .env (project root + cwd) so local run pe REDIRECT_URI mil jaye
 try:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+    load_dotenv()  # cwd ka .env bhi
 except Exception:
     pass
 
@@ -101,8 +103,8 @@ st.set_page_config(
 )
 
 USER_DB = os.path.join(os.path.dirname(__file__), "users.json")
-# Session store: sid -> {groq_api_key, _user_db_key, username}. Refresh pe URL se sid milne par session restore.
-SESSION_STORE_PATH = os.path.join(os.path.dirname(__file__), ".session_store.json")
+# Session store: sid -> session data. Streamlit Cloud pe repo read-only hota hai, isliye writable temp dir use karte hain.
+SESSION_STORE_PATH = os.path.join(tempfile.gettempdir(), "elastic_session_store.json")
 
 def _load_users():
     if os.path.exists(USER_DB):
@@ -354,6 +356,12 @@ def _get_google_auth_config():
             csec = _get(auth, "client_secret")
             if cid and csec:
                 redirect = _get(auth, "redirect_uri") or "http://localhost:8501/oauth2callback"
+                # Local run: .env mein REDIRECT_URI=http://localhost:8501 set karo taaki Google yahi redirect kare
+                env_redirect = os.environ.get("REDIRECT_URI", "").strip()
+                if env_redirect:
+                    if "/oauth2callback" not in env_redirect:
+                        env_redirect = env_redirect.rstrip("/") + "/oauth2callback"
+                    redirect = env_redirect
                 meta = _get(auth, "server_metadata_url") or "https://accounts.google.com/.well-known/openid-configuration"
                 return {
                     "client_id": str(cid).strip(),
@@ -491,22 +499,12 @@ if _code and _state and not st.session_state.authenticated:
             "username": st.session_state.username,
         }
         _save_session_store(store)
-        # Full-page redirect = naya request, session state empty. Isliye sid URL mein bhejo taaki next load pe restore ho.
+        # Redirect mat karo — isi request me session state set hai. Sirf OAuth params hatao aur rerun; main app dikhega.
         try:
-            _sid_js = json.dumps(sid)  # JS string ke liye safe
-            _redirect_html = (
-                '<script>(function(){'
-                'var sid = ' + _sid_js + ';'
-                'var origin = window.location.origin || "";'
-                'var base = origin + "/";'
-                'window.top.location.replace(base + "?sid=" + encodeURIComponent(sid));'
-                '})();</script>'
-            )
-            components.html(_redirect_html, height=0)
-            st.stop()
+            st.query_params.clear()
         except Exception:
-            # Fallback: rerun current script; agar same session hai to authenticated flag se main app dikhega.
-            st.rerun()
+            pass
+        st.rerun()
     else:
         st.session_state.auth_error = "Google sign-in failed. Try again."
     try:
@@ -592,6 +590,14 @@ if not st.session_state.authenticated:
     if not auth_url:
         st.error("Could not generate Google login URL. Check redirect_uri in secrets.")
         st.stop()
+
+    # redirect_uri_mismatch fix: Google Console mein yehi exact URI add karo (Copy karke)
+    _auth_cfg = _get_google_auth_config()
+    _ru = (_auth_cfg or {}).get("redirect_uri", "")
+    if _ru:
+        with st.expander("🔧 redirect_uri_mismatch? Is URI ko Google Console → Credentials → Authorized redirect URIs mein add karo"):
+            st.code(_ru, language=None)
+            st.caption("Copy the above URL and add it in Google Cloud Console if you see Error 400: redirect_uri_mismatch")
 
     _auth_error = st.session_state.get("auth_error")
     if _auth_error:
