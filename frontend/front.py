@@ -499,12 +499,25 @@ if _code and _state and not st.session_state.authenticated:
             "username": st.session_state.username,
         }
         _save_session_store(store)
-        # Redirect mat karo — isi request me session state set hai. Sirf OAuth params hatao aur rerun; main app dikhega.
+        # Google se wapas aate waqt naya request hota hai, session state nahi milti. Isliye sid URL mein bhej ke next load pe store se restore karte hain.
         try:
-            st.query_params.clear()
+            _sid_js = json.dumps(sid)
+            _redirect_html = (
+                '<script>(function(){'
+                'var sid = ' + _sid_js + ';'
+                'var origin = window.location.origin || "";'
+                'var base = origin + "/";'
+                'window.top.location.replace(base + "?sid=" + encodeURIComponent(sid));'
+                '})();</script>'
+            )
+            components.html(_redirect_html, height=0)
+            st.stop()
         except Exception:
-            pass
-        st.rerun()
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+            st.rerun()
     else:
         st.session_state.auth_error = "Google sign-in failed. Try again."
     try:
