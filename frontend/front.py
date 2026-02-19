@@ -491,14 +491,15 @@ if _code and _state and not st.session_state.authenticated:
             "username": st.session_state.username,
         }
         _save_session_store(store)
-        # Local session already authenticated; ab browser ko app root pe bhejo.
-        # Next load pe session_state.authenticated True hoga → direct main app.
+        # Full-page redirect = naya request, session state empty. Isliye sid URL mein bhejo taaki next load pe restore ho.
         try:
+            _sid_js = json.dumps(sid)  # JS string ke liye safe
             _redirect_html = (
                 '<script>(function(){'
+                'var sid = ' + _sid_js + ';'
                 'var origin = window.location.origin || "";'
                 'var base = origin + "/";'
-                'window.top.location.replace(base);'
+                'window.top.location.replace(base + "?sid=" + encodeURIComponent(sid));'
                 '})();</script>'
             )
             components.html(_redirect_html, height=0)
@@ -514,9 +515,13 @@ if _code and _state and not st.session_state.authenticated:
         pass
     st.rerun()
 
-# 2) Restore session from sid (refresh or cookie redirect)
+# 2) Restore session from sid (refresh or OAuth redirect)
 if _sid and not st.session_state.authenticated:
     if _restore_session_from_sid(_sid):
+        try:
+            st.query_params.pop("sid", None)
+        except Exception:
+            pass
         st.rerun()
 
 # 3) Authenticated: restore API keys from localStorage (restore_groq / restore_hf in URL)
