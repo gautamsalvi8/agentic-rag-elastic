@@ -105,6 +105,9 @@ st.set_page_config(
 USER_DB = os.path.join(os.path.dirname(__file__), "users.json")
 # Session store: sid -> session data. Streamlit Cloud pe repo read-only hota hai, isliye writable temp dir use karte hain.
 SESSION_STORE_PATH = os.path.join(tempfile.gettempdir(), "elastic_session_store.json")
+# OAuth state: Google redirect ke baad naya session hota hai, isliye state file mein save karke callback pe verify karte hain.
+OAUTH_STATES_PATH = os.path.join(tempfile.gettempdir(), "elastic_oauth_states.json")
+OAUTH_STATE_MAX_AGE_SEC = 600  # 10 min
 
 def _load_users():
     if os.path.exists(USER_DB):
@@ -311,6 +314,53 @@ def _save_session_store(store: dict):
         pass
 
 
+def _save_oauth_state(state: str) -> None:
+    """Google redirect se pehle state file mein save karo — callback pe naya session hoga."""
+    try:
+        data = {}
+        if os.path.exists(OAUTH_STATES_PATH):
+            try:
+                with open(OAUTH_STATES_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+        if not isinstance(data, dict):
+            data = {}
+        data[state] = time.time()
+        with open(OAUTH_STATES_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def _consume_oauth_state(state: str) -> bool:
+    """Callback pe state URL se aata hai — file mein hai aur expire nahi hua to True."""
+    if not (state or "").strip():
+        return False
+    state = state.strip()
+    try:
+        if not os.path.exists(OAUTH_STATES_PATH):
+            return False
+        with open(OAUTH_STATES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False
+        if state not in data:
+            return False
+        created = data[state]
+        if (time.time() - created) > OAUTH_STATE_MAX_AGE_SEC:
+            del data[state]
+            with open(OAUTH_STATES_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            return False
+        del data[state]
+        with open(OAUTH_STATES_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        return True
+    except Exception:
+        return False
+
+
 def _restore_session_from_sid(sid: str) -> bool:
     """If sid is valid, restore session state and return True (Google or legacy Groq session)."""
     if not (sid or "").strip():
@@ -389,7 +439,7 @@ def _get_google_auth_config():
 
 
 def _google_oauth_login_url():
-    """Return (authorization_url, state) for Google OAuth. State is stored in session for callback."""
+    """Return (authorization_url, state) for Google OAuth. State file mein save — callback pe naya session hota hai."""
     import requests
     config = _get_google_auth_config()
     if not config or not config.get("redirect_uri"):
@@ -402,6 +452,7 @@ def _google_oauth_login_url():
             return None, None
         state = secrets.token_urlsafe(24)
         st.session_state["_oauth_state"] = state
+        _save_oauth_state(state)  # File mein bhi — Google se wapas aate waqt naya session hoga
         scope = "openid email profile"
         url = (
             auth_endpoint
@@ -423,8 +474,8 @@ def _google_oauth_callback(code: str, state: str) -> dict:
     config = _get_google_auth_config()
     if not config:
         return {}
-    saved_state = st.session_state.get("_oauth_state")
-    if not saved_state or saved_state != state:
+    # Google se wapas aate waqt naya Streamlit session hota hai, isliye state file se verify karo
+    if not _consume_oauth_state(state):
         return {}
     try:
         r = requests.get(config["server_metadata_url"], timeout=10)
