@@ -117,6 +117,33 @@ def _save_users(users):
 def _hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
+
+def _encrypt_api_key(key: str) -> str:
+    """Lightweight reversible 'encryption' for API keys (base64 with prefix)."""
+    k = (key or "").strip()
+    if not k:
+        return ""
+    try:
+        b64 = base64.b64encode(k.encode("utf-8")).decode("utf-8")
+        return "enc:" + b64
+    except Exception:
+        return k
+
+
+def _decrypt_api_key(stored: str) -> str:
+    """Reverse of _encrypt_api_key; returns original value if not encrypted."""
+    s = (stored or "").strip()
+    if not s:
+        return ""
+    if s.startswith("enc:"):
+        try:
+            raw = s[4:]
+            decoded = base64.b64decode(raw.encode("utf-8")).decode("utf-8")
+            return decoded
+        except Exception:
+            return ""
+    return s
+
 def _register_user(username, email, password):
     users = _load_users()
     if username in users:
@@ -157,6 +184,17 @@ def _register_google_user(email, name, sub):
     }
     _save_users(users)
     return True
+
+
+def _email_user_key(email: str) -> str:
+    """Key in users.json for email+Groq based signup users."""
+    return (email or "").strip().lower()
+
+
+def _email_user_exists(email: str) -> bool:
+    users = _load_users()
+    key = _email_user_key(email)
+    return key in users
 
 
 def _validate_groq_api_key(api_key: str) -> tuple:
@@ -200,7 +238,8 @@ def _get_user_groq_key():
     if not key:
         return ""
     users = _load_users()
-    return (users.get(key) or {}).get("groq_api_key") or ""
+    stored = (users.get(key) or {}).get("groq_api_key") or ""
+    return _decrypt_api_key(stored)
 
 
 def _save_user_groq_key(api_key: str):
@@ -211,7 +250,7 @@ def _save_user_groq_key(api_key: str):
     users = _load_users()
     if db_key not in users:
         users[db_key] = {}
-    users[db_key]["groq_api_key"] = (api_key or "").strip()
+    users[db_key]["groq_api_key"] = _encrypt_api_key(api_key or "")
     _save_users(users)
     return True
 
@@ -452,12 +491,26 @@ if _code and _state and not st.session_state.authenticated:
             "username": st.session_state.username,
         }
         _save_session_store(store)
+        # Redirect browser to same app URL with only sid (no code/state) so main app loads
         try:
-            st.query_params.clear()
-            st.query_params["sid"] = sid
+            _sid_safe = sid.replace("'", "\\'").replace('"', '\\"')[:128]
+            _redirect_html = (
+                '<script>(function(){'
+                'var p = window.location.pathname || "/";'
+                'if (p.indexOf("?") >= 0) p = p.split("?")[0];'
+                'var s = "' + _sid_safe + '";'
+                'window.top.location.replace(p + "?sid=" + encodeURIComponent(s));'
+                '})();</script>'
+            )
+            components.html(_redirect_html, height=0)
+            st.stop()  # send this response; browser will redirect to ?sid= then load main app
         except Exception:
-            pass
-        st.rerun()
+            try:
+                st.query_params.clear()
+                st.query_params["sid"] = sid
+            except Exception:
+                pass
+            st.rerun()
     else:
         st.session_state.auth_error = "Google sign-in failed. Try again."
     try:
@@ -526,108 +579,389 @@ if not st.session_state.authenticated and not _sid and not _code:
 
 # ---------- Login only via Groq API key: key = auth, site detects account via key ----------
 if not st.session_state.authenticated:
-    _auth_logo_path = os.path.join(os.path.dirname(__file__), "static", "logo.png")
-    _auth_logo_alt = os.path.join(os.path.dirname(__file__), "static", "elasticnode-logo.png")
-    _logo_b64 = None
-    if os.path.exists(_auth_logo_path):
-        try:
-            with open(_auth_logo_path, "rb") as _f:
-                _logo_b64 = base64.b64encode(_f.read()).decode()
-        except Exception:
-            pass
-    if _logo_b64 is None and os.path.exists(_auth_logo_alt):
-        try:
-            with open(_auth_logo_alt, "rb") as _f:
-                _logo_b64 = base64.b64encode(_f.read()).decode()
-        except Exception:
-            pass
-    _logo_img = ('<img src="data:image/png;base64,' + _logo_b64 + '" alt="ElasticNode AI" class="auth-logo" style="cursor:pointer;">') if _logo_b64 else '<div class="auth-logo" style="font-size: 3rem; margin-bottom: 2rem; cursor: pointer;">🤖</div>'
+    auth_config = _get_google_auth_config()
+    if not auth_config:
+        st.warning(
+            "Google OAuth is not configured. "
+            "**Local:** Add `[auth]` in `.streamlit/secrets.toml` or `.env`. "
+            "**Streamlit Cloud:** App → Settings → Secrets."
+        )
+        st.caption("Google Cloud Console → APIs & Services → Credentials.")
+        st.stop()
+    auth_url, _ = _google_oauth_login_url()
+    if not auth_url:
+        st.error("Could not generate Google login URL. Check redirect_uri in secrets.")
+        st.stop()
+
+    _auth_error = st.session_state.get("auth_error")
+    if _auth_error:
+        st.session_state.auth_error = None
+
+    _auth_static = os.path.join(os.path.dirname(__file__), "static")
+    _logo_paths = [
+        os.path.join(_auth_static, "logo.png"),
+        os.path.join(_auth_static, "elasticnode-logo.png"),
+    ]
+    _logo_html = ""
+    for _lp in _logo_paths:
+        if os.path.exists(_lp):
+            try:
+                with open(_lp, "rb") as _f:
+                    _b64 = base64.b64encode(_f.read()).decode()
+                _logo_html = '<img src="data:image/png;base64,' + _b64 + '" alt="Logo" class="auth-split-logo" />'
+                break
+            except Exception:
+                pass
+    if not _logo_html:
+        _logo_html = '<div class="auth-split-logo-placeholder"><span>Logo</span></div>'
+
+    _illustration_src = ""
+    _illus_candidates = [
+        (os.path.join(PROJECT_ROOT, "assets", "chat_bot.gif"), "image/gif"),
+        (os.path.join(_auth_static, "auth-illustration.png"), "image/png"),
+        (os.path.join(_auth_static, "auth-right-bg.png"), "image/png"),
+    ]
+    for _ip, _mime in _illus_candidates:
+        if os.path.exists(_ip):
+            try:
+                with open(_ip, "rb") as _f:
+                    _b64 = base64.b64encode(_f.read()).decode()
+                _illustration_src = "data:" + _mime + ";base64," + _b64
+                break
+            except Exception:
+                pass
+
+    _GOOGLE_LOGO_URL = "https://www.gstatic.com/images/branding/googlelogo/svg/googlelogo_clr_74x24px.svg"
+    _auth_url_safe = auth_url.replace("'", "&#39;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+    _hash = "#"
 
     st.markdown("""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    #MainMenu, footer, header { visibility: hidden; }
-    .stDeployButton { display: none; }
+    #MainMenu, footer, header { visibility: hidden !important; }
+    [data-testid="stHeader"], [data-testid="stToolbar"], footer { display: none !important; }
+    .stDeployButton { display: none !important; }
     section[data-testid="stSidebar"] { display: none !important; }
-    html, body, [data-testid="stAppViewContainer"] { height: 100vh; overflow: hidden; background: white; }
-    .main { padding: 0 !important; height: 100vh; }
-    .block-container { padding: 0 !important; max-width: 100% !important; height: 100vh; }
-    div[data-testid="column"] { height: 100vh; }
-    .auth-left { flex: 1; background: linear-gradient(135deg, #8B5CF6, #EC4899, #EF4444, #3B82F6); background-size: 300% 300%; animation: gradientSwipe 10s ease infinite; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 3rem; position: relative; overflow: hidden; min-height: 100vh; }
-    @keyframes gradientSwipe { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
-    .auth-left::before { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: radial-gradient(circle at 30% 50%, rgba(255,255,255,0.1) 0%, transparent 50%); pointer-events: none; }
-    .auth-brand { position: relative; z-index: 1; text-align: center; max-width: 500px; }
-    .auth-label { font-size: 0.75rem; color: rgba(255,255,255,0.7); letter-spacing: 2px; text-transform: uppercase; margin-bottom: 2rem; font-weight: 500; -webkit-font-smoothing: antialiased; }
-    .auth-logo { width: 280px; height: auto; margin: 0 auto 2rem; display: block; filter: drop-shadow(0 10px 30px rgba(0,0,0,0.3)); }
-    .auth-heading { font-size: 2.5rem; font-weight: 700; color: white; line-height: 1.2; margin-bottom: 1rem; text-shadow: 0 2px 10px rgba(0,0,0,0.2); max-width: 400px; margin-left: auto; margin-right: auto; -webkit-font-smoothing: antialiased; }
-    .auth-subheading { font-size: 1rem; color: rgba(255,255,255,0.8); line-height: 1.6; max-width: 360px; margin: 0 auto; -webkit-font-smoothing: antialiased; }
-    .auth-right-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 3rem; min-height: 100vh; animation: fadeInUp 0.6s ease 0.2s both; }
-    @keyframes fadeInUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-    .auth-top-right { position: absolute; top: 2rem; right: 2rem; font-size: 0.875rem; color: #6B7280; font-weight: 500; }
-    .auth-form-container { width: 100%; max-width: 400px; }
-    .auth-form-heading { font-family: 'Playfair Display', Georgia, serif; font-size: 2.25rem; font-weight: 700; color: #111827; margin-bottom: 0.5rem; -webkit-font-smoothing: antialiased; }
-    .auth-form-subtitle { font-size: 0.875rem; color: #6B7280; margin-bottom: 2rem; line-height: 1.5; -webkit-font-smoothing: antialiased; }
-    .auth-btn-google-wrap .stLinkButton { width: 100% !important; }
-    .auth-btn-google-wrap .stLinkButton > a { width: 100% !important; padding: 0.875rem 1.5rem !important; font-size: 0.9375rem !important; font-weight: 500 !important; color: #111827 !important; background: white !important; border: 1px solid #E5E7EB !important; border-radius: 8px !important; display: flex !important; align-items: center !important; justify-content: center !important; gap: 0.75rem !important; text-decoration: none !important; transition: all 0.2s !important; }
-    .auth-btn-google-wrap .stLinkButton > a:hover { background: #F9FAFB !important; border-color: #D1D5DB !important; }
-    @media (max-width: 768px) { div[data-testid="column"] { height: auto !important; min-height: auto !important; } .auth-left { min-height: 40vh; padding: 2rem; } .auth-logo { width: 200px !important; } .auth-heading { font-size: 1.75rem !important; } .auth-form-heading { font-size: 1.875rem !important; } .auth-right-wrap { min-height: auto; padding: 2rem 1.5rem; } }
-    @media (max-width: 640px) { .auth-left { min-height: 35vh; padding: 1.5rem; } .auth-logo { width: 180px !important; } .auth-heading { font-size: 1.5rem !important; } .auth-subheading { font-size: 0.875rem !important; } }
+    html, body, [data-testid="stAppViewContainer"], .main { background: #FFFFFF !important; }
+    html, body, [data-testid="stAppViewContainer"] { height: 100vh; overflow: hidden !important; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+    .main { padding: 0 !important; height: 100vh !important; overflow: hidden !important; }
+    /* Full page: pure white */
+    .block-container { padding: 1.5rem !important; width: 100% !important; min-height: 100vh !important; display: flex !important; align-items: center !important; justify-content: center !important; background: #FFFFFF !important; }
+    /* Outer container: white, no tint, very subtle structure only */
+    .main [data-testid="stHorizontalBlock"] { width: 88% !important; max-width: 1200px !important; overflow: hidden !important; display: flex !important; flex-direction: row !important; flex-shrink: 0 !important; background: #FFFFFF !important; box-shadow: none !important; border: none !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child { flex: 0 0 320px !important; width: 320px !important; max-width: 320px !important; min-width: 0 !important; background: #FFFFFF !important; overflow: hidden !important; border: none !important; box-shadow: none !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:last-child { flex: 1 1 auto !important; min-width: 0 !important; background: #FFFFFF !important; }
+    /* Left panel: wrapper for vertical centering */
+    .left-panel { display: flex !important; flex-direction: column !important; justify-content: center !important; align-items: center !important; width: 100% !important; min-height: 100% !important; padding: 1rem !important; box-sizing: border-box !important; margin-top: 3rem !important; }
+    .left-form-wrapper { width: 320px !important; max-width: 320px !important; margin: 0 auto 12px !important; display: flex !important; flex-direction: column !important; gap: 8px !important; box-sizing: border-box !important; }
+    /* Left column: force 320px so Streamlit overrides nahi aaye — .main se specificity high */
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child > div { width: 320px !important; max-width: 320px !important; min-width: 0 !important; margin-left: auto !important; margin-right: auto !important; margin-bottom: 16px !important; box-sizing: border-box !important; overflow: hidden !important; border: none !important; box-shadow: none !important; background: transparent !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child > div > div { width: 100% !important; max-width: 100% !important; min-width: 0 !important; box-sizing: border-box !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child > * { width: 320px !important; max-width: 320px !important; min-width: 0 !important; box-sizing: border-box !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stVerticalBlock"] { width: 320px !important; max-width: 320px !important; min-width: 0 !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] { width: 320px !important; max-width: 320px !important; min-width: 0 !important; padding: 0 !important; overflow: hidden !important; box-sizing: border-box !important; border: none !important; box-shadow: none !important; background: transparent !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] > div { width: 320px !important; max-width: 320px !important; min-width: 0 !important; padding: 0 !important; margin: 8px 0 0 0 !important; box-sizing: border-box !important; border: none !important; box-shadow: none !important; background: transparent !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] [data-testid="stHorizontalBlock"] { width: 320px !important; max-width: 320px !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stTextInput"], .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stTextInput"] > div { width: 100% !important; max-width: 100% !important; min-width: 0 !important; box-sizing: border-box !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child input { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 44px !important; border-radius: 10px !important; box-sizing: border-box !important; border: 1px solid #d1d5db !important; background: #f8fafc !important; transition: border-color 0.2s, box-shadow 0.2s !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] input { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 44px !important; border-radius: 10px !important; box-sizing: border-box !important; border: 1px solid #d1d5db !important; background: #f8fafc !important; transition: border-color 0.2s, box-shadow 0.2s !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child .stButton { width: 100% !important; max-width: 100% !important; min-width: 0 !important; box-sizing: border-box !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] .stButton { width: 100% !important; max-width: 100% !important; min-width: 0 !important; box-sizing: border-box !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child .stButton > button { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 44px !important; border-radius: 10px !important; box-sizing: border-box !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child [data-testid="stForm"] .stButton > button { width: 100% !important; max-width: 100% !important; min-width: 0 !important; height: 44px !important; border-radius: 10px !important; box-sizing: border-box !important; background: #1f4ed8 !important; color: #ffffff !important; border: none !important; box-shadow: 0 2px 8px rgba(31,78,216,0.25) !important; }
+    .left-form-wrapper input, .left-form-wrapper button { width: 100% !important; max-width: 100% !important; height: 44px !important; border-radius: 10px !important; box-sizing: border-box !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child { padding: 0 !important; display: flex !important; flex-direction: column !important; justify-content: center !important; align-items: center !important; height: 100% !important; min-height: 400px !important; }
+    .auth-split-brand { display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; gap: 0.5rem; margin: 0 0 4px 0; }
+    .auth-split-logo { max-height: 56px; width: auto; }
+    .auth-split-logo-placeholder { width: 32px; height: 28px; background: #f8fafc; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.6rem; font-weight: 600; color: #94a3b8; }
+    .auth-split-brand-name { font-size: 1.05rem; font-weight: 700; color: #1a1a1a; letter-spacing: -0.02em; }
+    .auth-split-title { font-size: 1.25rem; font-weight: 700; color: #1a1a1a; margin: 0; letter-spacing: -0.02em; }
+    .auth-split-btn { display: inline-flex !important; align-items: center !important; justify-content: center !important; gap: 0.5rem !important; width: 100% !important; max-width: 100% !important; height: 44px !important; padding: 0 1rem !important; font-size: 14px !important; font-weight: 500 !important; border-radius: 10px !important; text-decoration: none !important; border: 1px solid #e2e8f0 !important; font-family: 'Inter', sans-serif !important; cursor: pointer !important; transition: box-shadow 0.2s !important; background: #fff !important; color: #334155 !important; margin: 0 !important; box-sizing: border-box !important; box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important; }
+    .auth-split-btn:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .auth-split-btn img { width: 18px; height: 18px; flex-shrink: 0; order: -1; }
+    .auth-split-divider { display: flex; align-items: center; margin: 0; color: #94a3b8; font-size: 14px; }
+    .auth-split-divider::before, .auth-split-divider::after { content: ''; flex: 1; height: 1px; background: #e2e8f0; }
+    .auth-split-divider span { padding: 0 0.5rem; }
+    /* Right panel: pure white, image blends in — no box or tint (unchanged) */
+    [data-testid="column"]:last-child { padding: 2rem 2.5rem !important; display: flex !important; align-items: center !important; justify-content: center !important; min-height: 400px !important; }
+    .auth-split-right-panel { width: 100%; height: 100%; display: flex !important; align-items: center !important; justify-content: center !important; background: transparent !important; }
+    .auth-split-illus-wrap { width: 90% !important; max-width: 100%; display: flex; align-items: center; justify-content: center; padding: 1rem; }
+    .auth-split-illus-wrap img { width: 100%; height: auto; object-fit: contain; display: block; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child input { padding: 0 1rem !important; font-size: 14px !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child input:focus { border-color: #1f4ed8 !important; box-shadow: 0 0 0 3px rgba(31,78,216,0.15) !important; outline: none !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child svg { color: #111827 !important; opacity: 0.9 !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child .stButton > button { padding: 0 1rem !important; font-size: 14px !important; font-weight: 600 !important; border: none !important; border-radius: 10px !important; }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child .stButton > button:hover { transform: translateY(-1px); }
+    .auth-split-forgot { color: #64748b; text-decoration: none; font-size: 13px; transition: color 0.2s; }
+    .auth-split-forgot:hover { color: #111827; }
+    /* Auth form primary button: robot blue, rounded, no stroke */
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child form .stButton > button {
+        background: #1f4ed8 !important;
+        color: #ffffff !important;
+        border: none !important;
+        border-radius: 10px !important;
+        box-shadow: 0 2px 8px rgba(31,78,216,0.25) !important;
+        transform: translateY(0);
+    }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child form .stButton > button:hover {
+        background: #1d4ed8 !important;
+        box-shadow: 0 4px 12px rgba(31,78,216,0.35) !important;
+        transform: translateY(-1px);
+    }
+    .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child form svg {
+        color: #111827 !important;
+        opacity: 0.9 !important;
+    }
+    .auth-split-signup { margin: 0; font-size: 13px; color: #64748b; text-align: center; }
+    .auth-split-signup a { color: #1f4ed8; text-decoration: none; font-weight: 500; }
+    .auth-split-signup a:hover { text-decoration: underline; }
+    .auth-split-error { background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; font-size: 0.8rem; padding: 0.5rem 0.75rem; border-radius: 10px; margin-top: 0.5rem; }
+    /* Custom email/password card (login container) */
+    .auth-email-card { background: #f3f4f6; border-radius: 16px; padding: 1.1rem 1.25rem 1.25rem; border: 1px solid rgba(148,163,184,0.35); box-shadow: 0 4px 14px rgba(15,23,42,0.06); display: flex; flex-direction: column; gap: 10px; }
+    .auth-email-input { width: 100%; height: 40px; border-radius: 10px; border: 1px solid #d1d5db; background: #f9fafb; padding: 0 1rem 0 2.25rem; font-size: 14px; box-sizing: border-box; transition: border-color 0.2s, box-shadow 0.2s, background 0.2s; }
+    .auth-email-input-email { background-image: url("data:image/svg+xml,%3Csvg width='16' height='16' viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='3' y='5' width='18' height='14' rx='2' ry='2' stroke='%2394A3B8' stroke-width='1.5'/%3E%3Cpath d='M4 7L11.2 11.6C11.7 11.9 12.3 11.9 12.8 11.6L20 7' stroke='%2394A3B8' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: 0.75rem 50%; background-size: 16px; }
+    .auth-email-input-password { background-image: url("data:image/svg+xml,%3Csvg width='16' height='16' viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='5' y='10' width='14' height='9' rx='2' ry='2' stroke='%2394A3B8' stroke-width='1.5'/%3E%3Cpath d='M9 10V8C9 5.8 10.3 4 12.5 4C14.7 4 16 5.8 16 8V10' stroke='%2394A3B8' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: 0.75rem 50%; background-size: 16px; }
+    .auth-email-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: #4b5563; margin-top: 4px; }
+    .auth-email-keep { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #4b5563; }
+    .auth-email-keep input[type="checkbox"] {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 12px !important;
+        height: 12px !important;
+        border-radius: 3px;
+        border: 1px solid #111827;
+        background: #ffffff;
+        display: inline-block;
+        position: relative;
+        cursor: pointer;
+        margin: 0;
+        padding: 0;
+    }
+    .auth-email-keep input[type="checkbox"]:checked::after {
+        content: "";
+        position: absolute;
+        left: 2px;
+        top: 1px;
+        width: 7px;
+        height: 4px;
+        border-left: 1.5px solid #111827;
+        border-bottom: 1.5px solid #111827;
+        transform: rotate(-45deg);
+    }
+    .auth-email-login-btn { width: 100%; margin-top: 10px; height: 40px; border-radius: 999px; border: none; background: #111827; color: #ffffff; font-size: 14px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 8px rgba(15,23,42,0.25); transition: box-shadow 0.2s, transform 0.2s, background 0.2s; }
+    .auth-email-login-btn:hover { background: #020617; box-shadow: 0 4px 12px rgba(15,23,42,0.35); transform: translateY(-1px); }
+    .auth-email-or { text-align: center; font-size: 13px; color: #94a3b8; margin: 4px 0 4px 0; }
+    .auth-loading-overlay { display: none; position: fixed; inset: 0; background: rgba(255,255,255,0.95); align-items: center; justify-content: center; z-index: 9999; flex-direction: column; gap: 0.75rem; }
+    .auth-loading-overlay.show { display: flex !important; }
+    .auth-spinner { width: 38px; height: 38px; border: 3px solid #e2e8f0; border-top-color: #1f4ed8; border-radius: 50%; animation: auth-spin 0.7s linear infinite; }
+    @keyframes auth-spin { to { transform: rotate(360deg); } }
+    .auth-loading-text { font-size: 0.85rem; color: #64748b; font-family: 'Inter', sans-serif; }
     </style>
     """, unsafe_allow_html=True)
 
-    _left_html = """
-    <div class="auth-left">
-        <div class="auth-brand">
-            <div class="auth-label">ELASTICNODE AI</div>
-            """ + _logo_img + """
-            <h1 class="auth-heading">Your Intelligent Document Assistant</h1>
-            <p class="auth-subheading">Powered by Hybrid Search + AI</p>
-        </div>
-    </div>
-    """
-    _right_header_html = """
-    <div class="auth-right-wrap" style="position: relative;">
-        <div class="auth-top-right">ElasticNode</div>
-        <div class="auth-form-container">
-            <h2 class="auth-form-heading">Welcome Back</h2>
-            <p class="auth-form-subtitle">Sign in with Google to access your AI-powered document assistant.</p>
-        </div>
-    </div>
-    """
-    _or_divider_html = """
-    <div style="display: flex; align-items: center; margin: 1.5rem 0; color: #9CA3AF; font-size: 0.875rem;">
-        <span style="flex: 1; border-top: 1px solid #E5E7EB;"></span>
-        <span style="padding: 0 1rem;">OR</span>
-        <span style="flex: 1; border-top: 1px solid #E5E7EB;"></span>
-    </div>
-    """
+    _error_html = ('<div class="auth-split-error">' + _auth_error.replace("<", "&lt;").replace(">", "&gt;") + '</div>') if _auth_error else ""
 
-    _c1, _c2 = st.columns(2)
-    with _c1:
-        st.markdown(_left_html, unsafe_allow_html=True)
-    with _c2:
-        st.markdown(_right_header_html, unsafe_allow_html=True)
-        if st.session_state.get("auth_error"):
-            st.error(st.session_state.auth_error)
-            st.session_state.auth_error = None
-        auth_config = _get_google_auth_config()
-        if not auth_config:
-            st.warning(
-                "Google OAuth is not configured. "
-                "**Local:** Add `[auth]` with client_id, client_secret, redirect_uri in `.streamlit/secrets.toml` or in `.env` as GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI. "
-                "**Streamlit Cloud:** In your app → Settings → Secrets, paste the same TOML (see secrets.toml.example). Set redirect_uri to your app URL + `/oauth2callback`."
+    # Decide whether to show Login or Signup view
+    _view_param = None
+    try:
+        if hasattr(st, "query_params") and hasattr(st.query_params, "get"):
+            _view_param = st.query_params.get("view")
+    except Exception:
+        _view_param = None
+    _auth_view = _view_param or ("signup" if st.session_state.get("show_signup") else "login")
+    if isinstance(_auth_view, (list, tuple)):
+        _auth_view = _auth_view[0] if _auth_view else "login"
+    _auth_view = "signup" if str(_auth_view).lower() == "signup" else "login"
+    st.session_state.show_signup = _auth_view == "signup"
+
+    _login_clicked = False
+    _user = _pass = ""
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        if _auth_view == "login":
+            # Login view: logo + custom email/password card + Google login
+            st.markdown(
+                '<div class="left-panel">'
+                '<div id="auth-form-ref" class="left-form-wrapper">'
+                '<div class="auth-split-brand">' + _logo_html + '</div>'
+                '</div>',
+                unsafe_allow_html=True,
             )
-            st.caption("Create OAuth credentials at Google Cloud Console → APIs & Services → Credentials.")
-            st.stop()
-        auth_url, _ = _google_oauth_login_url()
-        if auth_url:
-            st.markdown(_or_divider_html, unsafe_allow_html=True)
-            st.markdown('<div class="auth-btn-google-wrap">', unsafe_allow_html=True)
-            st.link_button("Sign in with Google", auth_url, type="secondary", use_container_width=True)
-            st.caption("You will be redirected to Google to sign in. Session persists across refresh and browser close.")
+            st.markdown(
+                '<div class="left-form-wrapper">'
+                '<div class="auth-email-card">'
+                '<input type="email" class="auth-email-input auth-email-input-email" name="elastic_login_email" placeholder="Email address" autocomplete="off" />'
+                '<input type="password" class="auth-email-input auth-email-input-password" name="elastic_login_password" placeholder="Password" autocomplete="off" />'
+                '<div class="auth-email-row">'
+                '<label class="auth-email-keep"><input type="checkbox" /> Remember me</label>'
+                '<a href="' + _hash + '" class="auth-split-forgot" style="font-size:12px;color:#6b7280;">Forgot password?</a>'
+                '</div>'
+                '<button type="button" class="auth-email-login-btn">Login</button>'
+                '</div>'
+                '<div class="auth-email-or">or</div>'
+                '<a href="' + _auth_url_safe + '" id="auth-google-link" class="auth-split-btn">'
+                '<img src="' + _GOOGLE_LOGO_URL + '" alt="" />Continue with Google</a>'
+                '</div>'
+                + _error_html
+                + '<p class="auth-split-signup">Don\'t have an account? <a href="?view=signup">Sign Up</a></p>'
+                + '</div>',
+                unsafe_allow_html=True,
+            )
         else:
-            st.error("Could not generate Google login URL. Check redirect_uri in secrets.")
+            # New signup page: email + Groq API key + Terms
+            st.markdown(
+                '<div class="left-panel">'
+                '<div id="auth-form-ref" class="left-form-wrapper">'
+                '<div class="auth-split-brand">' + _logo_html + '</div>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            with st.form("auth_signup_form", clear_on_submit=False):
+                _signup_email = st.text_input(
+                    "Email Address",
+                    placeholder="you@example.com",
+                    key="signup_email",
+                    label_visibility="collapsed",
+                )
+                _signup_key = st.text_input(
+                    "Groq API Key",
+                    placeholder="gsk_...",
+                    type="password",
+                    key="signup_groq_key",
+                    label_visibility="collapsed",
+                    help="Get your free API key at console.groq.com",
+                )
+                _signup_terms = st.checkbox(
+                    "I agree to Terms of Service and Privacy Policy",
+                    key="signup_terms",
+                )
+                _signup_clicked = st.form_submit_button("Create Account")
+
+            # Real-time inline validation hints (simple)
+            _se = (_signup_email or "").strip()
+            _sk = (_signup_key or "").strip()
+            _email_ok = bool(_se) and "@" in _se and "." in _se.split("@")[-1]
+            _key_format_ok = _sk.startswith("gsk_") and len(_sk) > 30
+
+            if _se:
+                st.caption("✅ Valid email" if _email_ok else "❌ Please enter a valid email address")
+            if _sk:
+                if _key_format_ok:
+                    st.caption("✅ Key format looks correct. Will verify with Groq on submit.")
+                else:
+                    st.caption("❌ Invalid format. Groq keys start with 'gsk_' and should be long.")
+
+            _signup_error_msg = ""
+
+            if _signup_clicked:
+                # Step 1: email checks
+                if not _se:
+                    _signup_error_msg = "Email required"
+                elif not _email_ok:
+                    _signup_error_msg = "Please enter a valid email address"
+                # Step 2: API key checks
+                elif not _sk:
+                    _signup_error_msg = "API key required"
+                elif not _sk.startswith("gsk_"):
+                    _signup_error_msg = "Invalid format. Groq keys start with 'gsk_'."
+                elif len(_sk) <= 30:
+                    _signup_error_msg = "API key too short"
+                # Step 3: Terms
+                elif not _signup_terms:
+                    _signup_error_msg = "You must agree to Terms of Service"
+                # Step 4: Email already exists?
+                elif _email_user_exists(_se):
+                    _signup_error_msg = "Account exists. Sign in instead?"
+                else:
+                    # Test key with Groq
+                    with st.spinner("Verifying Groq API key…"):
+                        _ok, _err = _validate_groq_api_key(_sk)
+                    if not _ok:
+                        _signup_error_msg = _err or "Invalid API key. Please check and try again."
+                    else:
+                        # Save user to users.json
+                        users = _load_users()
+                        db_key = _email_user_key(_se)
+                        username = (_se.split("@")[0] or "user").strip()
+                        users[db_key] = {
+                            "provider": "groq_email",
+                            "email": _se,
+                            "username": username,
+                            "groq_api_key": _encrypt_api_key(_sk),
+                            "created_at": datetime.now().isoformat(),
+                        }
+                        _save_users(users)
+
+                        # Auto-login user
+                        st.session_state.authenticated = True
+                        st.session_state.auth_provider = "groq"
+                        st.session_state.username = username
+                        st.session_state._user_db_key = db_key
+                        st.session_state.groq_api_key = _sk
+
+                        # Save Groq key for auto-restore (localStorage)
+                        _b64 = base64.urlsafe_b64encode(_sk.encode()).decode().rstrip("=")
+                        _safe = _b64.replace("\\", "\\\\").replace('"', '\\"')[:256]
+                        components.html(
+                            f'<script>try{{var b="{_safe}".replace(/-/g,"+").replace(/_/g,"/"); while(b.length%4) b+="="; var k=decodeURIComponent(escape(atob(b))); localStorage.setItem("elastic_groq_key",k);}}catch(e){{}}</script>',
+                            height=0,
+                        )
+
+                        st.success("Account created successfully! Redirecting to your dashboard…")
+                        st.balloons()
+                        time.sleep(1.8)
+                        st.rerun()
+
+            if _signup_error_msg:
+                st.error(_signup_error_msg)
+            else:
+                st.markdown(
+                    '<p class="auth-split-signup">Already have an account? <a href="?view=login">Sign In</a></p>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+    with col_right:
+        _right_content = (
+            '<div class="auth-split-right-panel"><div class="auth-split-illus-wrap">'
+            '<img src="' + _illustration_src + '" alt="Illustration" class="auth-split-illus" />'
+            '</div></div>'
+        ) if _illustration_src else (
+            '<div class="auth-split-right-panel"><div class="auth-split-illus-wrap">'
+            '<div class="auth-split-logo-placeholder" style="width:200px;height:200px;font-size:1rem;">Illustration</div>'
+            '</div></div>'
+        )
+        st.markdown(_right_content, unsafe_allow_html=True)
+
+    if _auth_view == "login" and _login_clicked:
+        if not (_user or "").strip() or not (_pass or "").strip():
+            st.session_state.auth_error = "Please enter email and password."
+            st.rerun()
+        else:
+            st.session_state.auth_error = None
+            st.session_state._auth_login_loading = True
+
+    st.markdown(
+        '<div id="auth-loading-overlay" class="auth-loading-overlay">'
+        '<div class="auth-spinner"></div>'
+        '<span class="auth-loading-text">Signing in…</span>'
+        '</div>'
+        '<script>(function(){'
+        'var g=document.getElementById("auth-google-link"); if(g) g.addEventListener("click",function(){ document.getElementById("auth-loading-overlay").classList.add("show"); });'
+        'var f=document.querySelector("form"); if(f) f.addEventListener("submit",function(){ document.getElementById("auth-loading-overlay").classList.add("show"); });'
+        'function authResize(){ var ref=document.getElementById("auth-form-ref"); if(!ref) return; var w=320; ref.style.setProperty("width",w+"px","important"); ref.style.setProperty("max-width",w+"px","important"); var col=ref.closest("[data-testid=column]"); if(!col) return; col.style.setProperty("width",w+"px","important"); col.style.setProperty("max-width",w+"px","important"); for(var i=0;i<col.children.length;i++){ var ch=col.children[i]; ch.style.setProperty("width",w+"px","important"); ch.style.setProperty("max-width",w+"px","important"); } var form=col.querySelector("form")||col.querySelector("[data-testid=stForm]"); if(form){ form.style.setProperty("width",w+"px","important"); form.style.setProperty("max-width",w+"px","important"); var p=form.parentElement; while(p&&p!==col){ p.style.setProperty("width",w+"px","important"); p.style.setProperty("max-width",w+"px","important"); p=p.parentElement; } } col.querySelectorAll("input").forEach(function(inp){ inp.style.setProperty("width","100%","important"); inp.style.setProperty("max-width","100%","important"); inp.style.setProperty("box-sizing","border-box","important"); }); col.querySelectorAll(".stButton").forEach(function(btn){ btn.style.setProperty("width",w+"px","important"); btn.style.setProperty("max-width",w+"px","important"); if(btn.firstElementChild){ btn.firstElementChild.style.setProperty("width","100%","important"); btn.firstElementChild.style.setProperty("max-width","100%","important"); } }); }'
+        'authResize(); setTimeout(authResize,100); setTimeout(authResize,300); setTimeout(authResize,600); setTimeout(authResize,1200); if(document.readyState!=="complete") window.addEventListener("load",function(){ authResize(); setTimeout(authResize,200); }); var col=document.querySelector("[data-testid=stHorizontalBlock] [data-testid=column]:first-child"); if(col){ var obs=new MutationObserver(function(){ authResize(); }); obs.observe(col,{childList:true,subtree:true}); }'
+        '})();</script>',
+        unsafe_allow_html=True,
+    )
+
+    if st.session_state.get("_auth_login_loading"):
+        st.session_state._auth_login_loading = False
+        st.markdown('<script>document.getElementById("auth-loading-overlay").classList.add("show");</script>', unsafe_allow_html=True)
+
     st.stop()
 
 # Login ke baad sid cookie set (top window + Secure): site band/reopen pe bhi session restore
