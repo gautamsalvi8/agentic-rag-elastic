@@ -1,6 +1,7 @@
 import sys, os, importlib
 import base64
 import hashlib
+import hmac
 import secrets
 import tempfile
 
@@ -105,9 +106,9 @@ st.set_page_config(
 USER_DB = os.path.join(os.path.dirname(__file__), "users.json")
 # Session store: sid -> session data. Streamlit Cloud pe repo read-only hota hai, isliye writable temp dir use karte hain.
 SESSION_STORE_PATH = os.path.join(tempfile.gettempdir(), "elastic_session_store.json")
-# OAuth state: Google redirect ke baad naya session hota hai, isliye state file mein save karke callback pe verify karte hain.
-OAUTH_STATES_PATH = os.path.join(tempfile.gettempdir(), "elastic_oauth_states.json")
-OAUTH_STATE_MAX_AGE_SEC = 600  # 10 min
+# OAuth state & session: file/store mat use karo — Streamlit Cloud pe alag instance pe file nahi milti. Signed tokens use karo.
+OAUTH_STATE_MAX_AGE_SEC = 600
+SESSION_TOKEN_MAX_AGE_SEC = 300  # 5 min
 
 def _load_users():
     if os.path.exists(USER_DB):
@@ -314,59 +315,104 @@ def _save_session_store(store: dict):
         pass
 
 
-def _save_oauth_state(state: str) -> None:
-    """Google redirect se pehle state file mein save karo — callback pe naya session hoga."""
+def _get_oauth_secret() -> bytes:
+    """HMAC/signing ke liye secret — kisi bhi instance pe same hona chahiye (secrets se)."""
+    raw = ""
     try:
-        data = {}
-        if os.path.exists(OAUTH_STATES_PATH):
-            try:
-                with open(OAUTH_STATES_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                pass
-        if not isinstance(data, dict):
-            data = {}
-        data[state] = time.time()
-        with open(OAUTH_STATES_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        auth = getattr(st.secrets, "auth", None) or (st.secrets.get("auth") if hasattr(st.secrets, "get") else None) or st.secrets.get("auth", {})
+        if hasattr(auth, "get"):
+            raw = (auth.get("cookie_secret") or "") or getattr(auth, "cookie_secret", "")
+        else:
+            raw = getattr(auth, "cookie_secret", "") or ""
     except Exception:
         pass
+    raw = (raw or os.environ.get("OAUTH_COOKIE_SECRET", "") or "elastic-default-secret-change-in-production").strip()
+    return hashlib.sha256(raw.encode("utf-8")).digest()
 
 
-def _consume_oauth_state(state: str) -> bool:
-    """Callback pe state URL se aata hai — file mein hai aur expire nahi hua to True."""
+def _b64url_encode(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = (4 - len(s) % 4) % 4
+    return base64.urlsafe_b64decode(s + ("=" * pad))
+
+
+def _create_oauth_state() -> str:
+    """Signed state — kisi file/store ki zaroorat nahi, kisi bhi instance pe verify ho jata hai."""
+    payload = str(time.time()) + "." + secrets.token_urlsafe(16)
+    sig = hmac.new(_get_oauth_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return _b64url_encode((payload + "." + sig).encode("utf-8"))
+
+
+def _verify_oauth_state(state: str) -> bool:
+    """State verify karo (signature + expiry)."""
     if not (state or "").strip():
         return False
-    state = state.strip()
     try:
-        if not os.path.exists(OAUTH_STATES_PATH):
+        raw = _b64url_decode(state.strip()).decode("utf-8", errors="strict")
+        parts = raw.rsplit(".", 1)
+        if len(parts) != 2:
             return False
-        with open(OAUTH_STATES_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
+        payload, sig = parts[0], parts[1]
+        if not hmac.compare_digest(hmac.new(_get_oauth_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest(), sig):
             return False
-        if state not in data:
+        ts = float(payload.split(".")[0])
+        if (time.time() - ts) > OAUTH_STATE_MAX_AGE_SEC:
             return False
-        created = data[state]
-        if (time.time() - created) > OAUTH_STATE_MAX_AGE_SEC:
-            del data[state]
-            with open(OAUTH_STATES_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            return False
-        del data[state]
-        with open(OAUTH_STATES_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f)
         return True
     except Exception:
         return False
 
 
+def _create_session_token(username: str, db_key: str, provider: str = "google") -> str:
+    """Signed sid — payload base64, phir . se sig — URL safe, kisi store ki zaroorat nahi."""
+    payload_json = json.dumps({
+        "u": username or "User",
+        "k": db_key or "",
+        "p": provider or "google",
+        "exp": time.time() + SESSION_TOKEN_MAX_AGE_SEC,
+    }, separators=(",", ":"))
+    payload_b64 = _b64url_encode(payload_json.encode("utf-8"))
+    sig = hmac.new(_get_oauth_secret(), payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
+    return payload_b64 + "." + sig
+
+
+def _verify_session_token(sid: str) -> dict:
+    """Sid verify karke payload return karo ya {}."""
+    if not (sid or "").strip():
+        return {}
+    try:
+        parts = (sid.strip()).split(".", 1)
+        if len(parts) != 2:
+            return {}
+        payload_b64, sig = parts[0], parts[1]
+        if not hmac.compare_digest(hmac.new(_get_oauth_secret(), payload_b64.encode("utf-8"), hashlib.sha256).hexdigest(), sig):
+            return {}
+        payload_json = _b64url_decode(payload_b64).decode("utf-8", errors="strict")
+        data = json.loads(payload_json)
+        if (data.get("exp") or 0) < time.time():
+            return {}
+        return data
+    except Exception:
+        return {}
+
+
 def _restore_session_from_sid(sid: str) -> bool:
-    """If sid is valid, restore session state and return True (Google or legacy Groq session)."""
+    """Pehle signed token try karo (Cloud multi-instance), phir purana store."""
     if not (sid or "").strip():
         return False
+    sid = sid.strip()
+    data = _verify_session_token(sid)
+    if data:
+        st.session_state.authenticated = True
+        st.session_state.auth_provider = data.get("p", "google")
+        st.session_state._user_db_key = data.get("k", "")
+        st.session_state.username = data.get("u", "User")
+        return True
     store = _load_session_store()
-    data = store.get((sid or "").strip())
+    data = store.get(sid)
     if not data:
         return False
     provider = data.get("auth_provider") or ("groq" if data.get("groq_api_key") else "google")
@@ -439,7 +485,7 @@ def _get_google_auth_config():
 
 
 def _google_oauth_login_url():
-    """Return (authorization_url, state) for Google OAuth. State file mein save — callback pe naya session hota hai."""
+    """Return (authorization_url, state). State = signed token — kisi file ki zaroorat nahi, sab instances pe verify."""
     import requests
     config = _get_google_auth_config()
     if not config or not config.get("redirect_uri"):
@@ -450,9 +496,8 @@ def _google_oauth_login_url():
         auth_endpoint = meta.get("authorization_endpoint")
         if not auth_endpoint:
             return None, None
-        state = secrets.token_urlsafe(24)
+        state = _create_oauth_state()
         st.session_state["_oauth_state"] = state
-        _save_oauth_state(state)  # File mein bhi — Google se wapas aate waqt naya session hoga
         scope = "openid email profile"
         url = (
             auth_endpoint
@@ -474,8 +519,8 @@ def _google_oauth_callback(code: str, state: str) -> dict:
     config = _get_google_auth_config()
     if not config:
         return {}
-    # Google se wapas aate waqt naya Streamlit session hota hai, isliye state file se verify karo
-    if not _consume_oauth_state(state):
+    # Google se wapas aate waqt naya session hota hai — state ko signed token se verify karo (file nahi)
+    if not _verify_oauth_state(state):
         return {}
     try:
         r = requests.get(config["server_metadata_url"], timeout=10)
@@ -542,15 +587,15 @@ if _code and _state and not st.session_state.authenticated:
         st.session_state.auth_provider = "google"
         st.session_state.username = name or email or "User"
         st.session_state._user_db_key = db_key
-        sid = secrets.token_urlsafe(16)
-        store = _load_session_store()
-        store[sid] = {
-            "auth_provider": "google",
-            "_user_db_key": db_key,
-            "username": st.session_state.username,
-        }
-        _save_session_store(store)
-        # Google se wapas aate waqt naya request hota hai, session state nahi milti. Isliye sid URL mein bhej ke next load pe store se restore karte hain.
+        # Signed sid — kisi store ki zaroorat nahi, kisi bhi instance pe verify ho jata hai (Cloud multi-instance fix)
+        sid = _create_session_token(st.session_state.username, db_key, "google")
+        # Optional: purane store mein bhi daal do taaki cookie/sid restore bhi kaam kare
+        try:
+            store = _load_session_store()
+            store[sid] = {"auth_provider": "google", "_user_db_key": db_key, "username": st.session_state.username}
+            _save_session_store(store)
+        except Exception:
+            pass
         try:
             _sid_js = json.dumps(sid)
             _redirect_html = (
