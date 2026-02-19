@@ -491,14 +491,21 @@ if _code and _state and not st.session_state.authenticated:
             "username": st.session_state.username,
         }
         _save_session_store(store)
-        # Local session already authenticated; sid is for long-lived restore.
-        # URL se code/state hata kar sid add karte hain, phir rerun → main app dikhega.
+        # Local session already authenticated; ab browser ko app root pe bhejo.
+        # Next load pe session_state.authenticated True hoga → direct main app.
         try:
-            st.query_params.clear()
-            st.query_params["sid"] = sid
+            _redirect_html = (
+                '<script>(function(){'
+                'var origin = window.location.origin || "";'
+                'var base = origin + "/";'
+                'window.top.location.replace(base);'
+                '})();</script>'
+            )
+            components.html(_redirect_html, height=0)
+            st.stop()
         except Exception:
-            pass
-        st.rerun()
+            # Fallback: rerun current script; agar same session hai to authenticated flag se main app dikhega.
+            st.rerun()
     else:
         st.session_state.auth_error = "Google sign-in failed. Try again."
     try:
