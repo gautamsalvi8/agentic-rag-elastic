@@ -491,26 +491,14 @@ if _code and _state and not st.session_state.authenticated:
             "username": st.session_state.username,
         }
         _save_session_store(store)
-        # Redirect browser to same app URL with only sid (no code/state) so main app loads
+        # Local session already authenticated; sid is for long-lived restore.
+        # URL se code/state hata kar sid add karte hain, phir rerun → main app dikhega.
         try:
-            _sid_safe = sid.replace("'", "\\'").replace('"', '\\"')[:128]
-            _redirect_html = (
-                '<script>(function(){'
-                'var p = window.location.pathname || "/";'
-                'if (p.indexOf("?") >= 0) p = p.split("?")[0];'
-                'var s = "' + _sid_safe + '";'
-                'window.top.location.replace(p + "?sid=" + encodeURIComponent(s));'
-                '})();</script>'
-            )
-            components.html(_redirect_html, height=0)
-            st.stop()  # send this response; browser will redirect to ?sid= then load main app
+            st.query_params.clear()
+            st.query_params["sid"] = sid
         except Exception:
-            try:
-                st.query_params.clear()
-                st.query_params["sid"] = sid
-            except Exception:
-                pass
-            st.rerun()
+            pass
+        st.rerun()
     else:
         st.session_state.auth_error = "Google sign-in failed. Try again."
     try:
