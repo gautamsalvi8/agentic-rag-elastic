@@ -45,17 +45,21 @@ from dotenv import load_dotenv
 from elasticsearch import Elasticsearch
 from sentence_transformers import SentenceTransformer
 
-# Load environment variables
+# Load environment variables (from project root when run from frontend)
+_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv(os.path.join(_root, ".env"))
 load_dotenv()
 
 # Initialize embedding model once
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Connect to Elasticsearch
-es = Elasticsearch(
-    hosts="http://localhost:9200",
-    basic_auth=("elastic", os.getenv("ELASTIC_PASSWORD"))
-)
+# Connect to Elasticsearch (hosts required; support cloud + local)
+_url = os.getenv("ELASTIC_URL") or "http://localhost:9200"
+_api_key = os.getenv("ELASTIC_API_KEY")
+if _api_key:
+    es = Elasticsearch(hosts=[_url], api_key=_api_key)
+else:
+    es = Elasticsearch(hosts=[_url], basic_auth=("elastic", os.getenv("ELASTIC_PASSWORD", "changeme")))
 
 # Sample documents to index
 documents = [

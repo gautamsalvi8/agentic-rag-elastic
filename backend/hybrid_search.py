@@ -10,15 +10,22 @@ from backend.cache import get_cached_query, set_cached_query
 from backend.reranker import Reranker
 from backend.metrics_logger import MetricsLogger
 
+# Load .env from project root so ELASTIC_* are set when run from frontend
+_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv(os.path.join(_root, ".env"))
 load_dotenv()
+
+def _es_client():
+    url = os.getenv("ELASTIC_URL") or "http://localhost:9200"
+    api_key = os.getenv("ELASTIC_API_KEY")
+    if api_key:
+        return Elasticsearch(hosts=[url], api_key=api_key)
+    return Elasticsearch(hosts=[url], basic_auth=("elastic", os.getenv("ELASTIC_PASSWORD", "changeme")))
 
 class HybridSearch:
 
     def __init__(self):
-        self.es = Elasticsearch(
-            os.getenv("ELASTIC_URL"),
-            api_key=os.getenv("ELASTIC_API_KEY")
-        )
+        self.es = _es_client()
 
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
         self.reranker = Reranker()

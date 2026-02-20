@@ -20,21 +20,24 @@ from sentence_transformers import SentenceTransformer
 from backend.chunker import chunk_text
 import time
 
+_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv(os.path.join(_root, ".env"))
 load_dotenv()
+
+
+def _es_client():
+    url = os.getenv("ELASTIC_URL") or "http://localhost:9200"
+    api_key = os.getenv("ELASTIC_API_KEY")
+    if api_key:
+        return Elasticsearch(hosts=[url], api_key=api_key, request_timeout=60, max_retries=3, retry_on_timeout=True)
+    return Elasticsearch(hosts=[url], basic_auth=("elastic", os.getenv("ELASTIC_PASSWORD", "changeme")), request_timeout=60, max_retries=3, retry_on_timeout=True)
 
 
 class BulkIngest:
 
     def __init__(self):
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
-
-        self.es = Elasticsearch(
-    os.getenv("ELASTIC_URL"),
-    api_key=os.getenv("ELASTIC_API_KEY"),
-    request_timeout=60,
-    max_retries=3,
-    retry_on_timeout=True
-)
+        self.es = _es_client()
 
         self.index = "rag-docs"
 

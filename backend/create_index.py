@@ -5,22 +5,23 @@ from dotenv import load_dotenv
 from elasticsearch import Elasticsearch
 
 # ---------------------------------
-# Load environment variables
+# Load environment variables (from project root when run from frontend)
 # ---------------------------------
+_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv(os.path.join(_root, ".env"))
 load_dotenv()
 
-ELASTIC_URL = os.getenv("ELASTIC_URL", "http://localhost:9200")
+ELASTIC_URL = os.getenv("ELASTIC_URL") or "http://localhost:9200"
 ELASTIC_API_KEY = os.getenv("ELASTIC_API_KEY")
 
 # ---------------------------------
-# Connect to Elasticsearch
+# Connect to Elasticsearch (hosts required; never pass None)
 # ---------------------------------
-# Supports both API key (Elastic Cloud) and basic auth (local)
 if ELASTIC_API_KEY:
-    es = Elasticsearch(ELASTIC_URL, api_key=ELASTIC_API_KEY)
+    es = Elasticsearch(hosts=[ELASTIC_URL], api_key=ELASTIC_API_KEY)
 else:
     ELASTIC_PASSWORD = os.getenv("ELASTIC_PASSWORD", "changeme")
-    es = Elasticsearch(ELASTIC_URL, basic_auth=("elastic", ELASTIC_PASSWORD))
+    es = Elasticsearch(hosts=[ELASTIC_URL], basic_auth=("elastic", ELASTIC_PASSWORD))
 
 INDEX_NAME = "rag-docs"
 

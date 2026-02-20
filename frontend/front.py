@@ -1,4 +1,9 @@
 import sys, os, importlib
+import warnings
+
+# Suppress st.cache deprecation warning from dependencies (e.g. cookie manager)
+warnings.filterwarnings("ignore", message=".*st\\.cache.*deprecated.*", category=DeprecationWarning)
+
 import base64
 import hashlib
 import hmac
@@ -24,7 +29,7 @@ import streamlit.components.v1 as components
 import PyPDF2
 from io import BytesIO
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import pandas as pd
 import plotly.express as px
@@ -42,15 +47,42 @@ def _env_from_secrets():
             pass
 _env_from_secrets()
 
+# Persistent session cookie (survives app restart / new tab). Optional: requires streamlit-cookies-manager + COOKIE_PASSWORD in secrets.
+_cookie_manager = None
+_CookiesNotReady = None
+try:
+    from streamlit_cookies_manager import EncryptedCookieManager
+    try:
+        from streamlit_cookies_manager import CookiesNotReady as _CookiesNotReady
+    except ImportError:
+        pass
+    _cookie_pwd = os.environ.get("COOKIE_PASSWORD")
+    if not _cookie_pwd and hasattr(st, "secrets"):
+        _cookie_pwd = getattr(st.secrets, "COOKIE_PASSWORD", None) or (st.secrets.get("COOKIE_PASSWORD") if callable(getattr(st.secrets, "get", None)) else None)
+    if _cookie_pwd:
+        _cookie_manager = EncryptedCookieManager(prefix="elasticnode_", password=_cookie_pwd)
+except Exception:
+    pass
+
 # Reload backend modules so code fixes apply without full process restart.
-# Only class definitions are reloaded; heavy model weights load in __init__() only.
 for _mn in ['backend.hybrid_search', 'backend.bulk_ingest', 'backend.generator']:
     if _mn in sys.modules:
         importlib.reload(sys.modules[_mn])
 
-from backend.hybrid_search import HybridSearch
-from backend.bulk_ingest import BulkIngest
-from backend.generator import Generator
+# Backend imports: safe so app starts even if one module fails (e.g. missing deps)
+HybridSearch = BulkIngest = Generator = None
+try:
+    from backend.hybrid_search import HybridSearch
+except ImportError:
+    pass
+try:
+    from backend.bulk_ingest import BulkIngest
+except ImportError:
+    pass
+try:
+    from backend.generator import Generator
+except ImportError:
+    pass
 
 # Bump this when backend runtime objects need re-init after fixes.
 BACKEND_RUNTIME_VERSION = "2026-02-15-runtime-fix-6"
@@ -67,12 +99,19 @@ if "google_intent" not in st.session_state:
 
 def _handle_logout():
     """Callback — runs BEFORE the next rerun when Logout is clicked."""
+    _clear_persistent_session()
     try:
         _sid = st.query_params.get("sid") if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
         if _sid:
             store = _load_session_store()
             store.pop(_sid, None)
             _save_session_store(store)
+        # Remove URL session token from sessions.json so link no longer works
+        _url_tok = st.query_params.get("session") if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
+        if _url_tok:
+            sessions = _load_url_sessions()
+            sessions.pop(_url_tok, None)
+            _save_url_sessions(sessions)
         try:
             if hasattr(st, "query_params") and hasattr(st.query_params, "clear"):
                 st.query_params.clear()
@@ -106,9 +145,62 @@ st.set_page_config(
 USER_DB = os.path.join(os.path.dirname(__file__), "users.json")
 # Session store: sid -> session data. Streamlit Cloud pe repo read-only hota hai, isliye writable temp dir use karte hain.
 SESSION_STORE_PATH = os.path.join(tempfile.gettempdir(), "elastic_session_store.json")
+# URL-based persistent sessions (survives restart; bookmark URL with ?session=token)
+SESSIONS_DB = os.path.join(os.path.dirname(__file__), "sessions.json")
+URL_SESSION_EXPIRY_DAYS = 30
 # OAuth state & session: file/store mat use karo — Streamlit Cloud pe alag instance pe file nahi milti. Signed tokens use karo.
 OAUTH_STATE_MAX_AGE_SEC = 600
 SESSION_TOKEN_MAX_AGE_SEC = 300  # 5 min
+
+def _load_url_sessions():
+    """Load session token -> {username, _user_db_key, auth_provider, created} from sessions.json."""
+    try:
+        if os.path.exists(SESSIONS_DB):
+            with open(SESSIONS_DB, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _save_url_sessions(sessions):
+    try:
+        with open(SESSIONS_DB, "w", encoding="utf-8") as f:
+            json.dump(sessions, f, indent=2)
+    except Exception:
+        pass
+
+def _create_url_session_token(username: str, db_key: str, provider: str) -> str:
+    """Create persistent URL session token; save to sessions.json. Returns token."""
+    token = secrets.token_urlsafe(16)
+    sessions = _load_url_sessions()
+    sessions[token] = {
+        "username": username,
+        "_user_db_key": db_key or "",
+        "auth_provider": provider or "google",
+        "created": datetime.now().isoformat(),
+    }
+    _save_url_sessions(sessions)
+    return token
+
+def _validate_url_session_token(token: str):
+    """Validate URL session token. Returns session dict or None."""
+    if not (token or "").strip():
+        return None
+    sessions = _load_url_sessions()
+    data = sessions.get((token or "").strip())
+    if not data or not isinstance(data, dict):
+        return None
+    created = data.get("created") or ""
+    if created:
+        try:
+            created_dt = datetime.fromisoformat(created)
+            if datetime.now() - created_dt > timedelta(days=URL_SESSION_EXPIRY_DAYS):
+                del sessions[(token or "").strip()]
+                _save_url_sessions(sessions)
+                return None
+        except Exception:
+            pass
+    return data
 
 def _load_users():
     if os.path.exists(USER_DB):
@@ -323,6 +415,65 @@ def _set_groq_key_from_db_on_restore():
     key = _get_user_groq_key()
     if key:
         st.session_state.groq_api_key = key
+
+
+def _save_persistent_session():
+    """Save current auth to encrypted cookie (7 days) so login survives app restart."""
+    cm = globals().get("_cookie_manager")
+    if not cm:
+        return
+    try:
+        if not getattr(cm, "ready", lambda: False)():
+            return
+        session = {
+            "username": st.session_state.get("username") or "User",
+            "_user_db_key": st.session_state.get("_user_db_key") or "",
+            "auth_provider": st.session_state.get("auth_provider") or "google",
+            "expiry": (datetime.now() + timedelta(days=7)).isoformat(),
+        }
+        cm["session"] = json.dumps(session)
+        cm.save()
+    except Exception:
+        pass
+
+
+def _load_persistent_session():
+    """If valid session in cookie, restore into session_state and return True."""
+    cm = globals().get("_cookie_manager")
+    if not cm:
+        return False
+    try:
+        if not getattr(cm, "ready", lambda: False)():
+            return False
+        if "session" not in cm:
+            return False
+        session = json.loads(cm["session"])
+        expiry = datetime.fromisoformat(session.get("expiry", ""))
+        if datetime.now() >= expiry:
+            return False
+        st.session_state.authenticated = True
+        st.session_state.username = session.get("username", "User")
+        st.session_state._user_db_key = session.get("_user_db_key", "")
+        st.session_state.auth_provider = session.get("auth_provider", "google")
+        _set_groq_key_from_db_on_restore()
+        return True
+    except Exception:
+        return False
+
+
+def _clear_persistent_session():
+    """Remove persistent session cookie (on logout)."""
+    cm = globals().get("_cookie_manager")
+    if not cm:
+        return
+    try:
+        if not getattr(cm, "ready", lambda: False)():
+            return
+        if "session" in cm:
+            del cm["session"]
+            cm.save()
+    except Exception:
+        pass
 
 
 def _save_user_groq_key(api_key: str):
@@ -659,8 +810,9 @@ try:
     _login_username_param = _qp.get("login_username") if _qp else None
     _login_key_param = _qp.get("login_key") if _qp else None
     _remember_param = _qp.get("remember") if _qp else None
+    _session_param = _one(_qp.get("session")) if _qp else None
 except Exception:
-    _sid = _code = _state = _restore_groq = _restore_hf = _login_username_param = _login_key_param = _remember_param = None
+    _sid = _code = _state = _restore_groq = _restore_hf = _login_username_param = _login_key_param = _remember_param = _session_param = None
 
 # 1) OAuth callback: Google redirected back with code & state
 # Agar pehle hi pending_sid hai (URL update nahi hua) to sid wale URL pe meta-refresh se bhejo
@@ -690,6 +842,7 @@ if _code and _state and not st.session_state.authenticated:
         st.session_state.auth_provider = "google"
         st.session_state.username = name or email or "User"
         st.session_state._user_db_key = db_key
+        _save_persistent_session()
         # Sid banao — next run pe sid se restore (ya same session mein hi authenticated rahega)
         sid = _create_session_token(st.session_state.username, db_key, "google")
         try:
@@ -698,17 +851,21 @@ if _code and _state and not st.session_state.authenticated:
             _save_session_store(store)
         except Exception:
             pass
-        # URL update ke liye: sid set karo, rerun. Agar URL nahi badla to next run pe meta-refresh fallback
+        # URL session token so refresh/bookmark keeps user logged in (works on Streamlit Cloud)
+        _url_token_google = _create_url_session_token(st.session_state.username, db_key, "google")
+        # URL update ke liye: sid + session set karo, rerun
         st.session_state["_oauth_pending_sid"] = sid
         try:
             st.query_params.clear()
             st.query_params["sid"] = sid
+            st.query_params["session"] = _url_token_google
             time.sleep(0.2)  # Streamlit URL sync
         except Exception:
             try:
                 for k in ["code", "state"]:
                     st.query_params.pop(k, None)
                 st.query_params["sid"] = sid
+                st.query_params["session"] = _url_token_google
             except Exception:
                 pass
         st.rerun()
@@ -736,6 +893,39 @@ if _sid and st.session_state.authenticated:
     except Exception:
         pass
     st.rerun()
+
+# 2b-url) URL session token (?session=...) — persists on Streamlit Cloud; restore without cookie
+if not st.session_state.authenticated and not _sid and not _code and _session_param:
+    _url_data = _validate_url_session_token(_session_param)
+    if _url_data:
+        st.session_state.authenticated = True
+        st.session_state.username = _url_data.get("username", "User")
+        st.session_state._user_db_key = _url_data.get("_user_db_key", "")
+        st.session_state.auth_provider = _url_data.get("auth_provider", "google")
+        _set_groq_key_from_db_on_restore()
+        st.rerun()
+
+# 2c) Not authenticated, no sid/code: try persistent encrypted cookie (survives app restart)
+if not st.session_state.authenticated and not _sid and not _code:
+    _cm = globals().get("_cookie_manager")
+    _cookie_waits = st.session_state.get("_cookie_wait_count", 0)
+    try:
+        # Cookie component needs a run to load from browser; wait so refresh keeps you logged in
+        if _cm and not getattr(_cm, "ready", lambda: False)():
+            if _cookie_waits < 3:  # allow up to 3 waits so component can load
+                st.session_state["_cookie_wait_count"] = _cookie_waits + 1
+                with st.spinner("Loading session…"):
+                    st.stop()
+        st.session_state["_cookie_wait_count"] = 0  # reset on success path
+        if _load_persistent_session():
+            st.rerun()
+    except Exception:
+        # CookiesNotReady or any cookie error: wait for next run (component will load)
+        if _cookie_waits < 3:
+            st.session_state["_cookie_wait_count"] = _cookie_waits + 1
+            with st.spinner("Loading session…"):
+                st.stop()
+        st.session_state["_cookie_wait_count"] = 0  # reset so next visit can try again
 
 # 3) Authenticated: restore API keys from localStorage (restore_groq / restore_hf in URL)
 if st.session_state.authenticated and (_restore_groq or _restore_hf):
@@ -797,7 +987,11 @@ if not st.session_state.authenticated:
         _lu = (_login_username_param if isinstance(_login_username_param, str) else (_login_username_param[0] if _login_username_param else "")).strip()
         _lk = (_login_key_param if isinstance(_login_key_param, str) else (_login_key_param[0] if _login_key_param else "")).strip()
         if _lu or _lk:
-            result = _login_username_groq(_lu, _lk)
+            # Accept username OR email: if input contains @ use email login, else username login
+            if "@" in _lu:
+                result = _login_email_groq(_lu, _lk)
+            else:
+                result = _login_username_groq(_lu, _lk)
             if result[0] is True:
                 _, _username, _db_key = result
                 st.session_state.authenticated = True
@@ -813,9 +1007,16 @@ if not st.session_state.authenticated:
                     _save_session_store(store)
                 except Exception:
                     pass
+                # URL session token so refresh/bookmark keeps user logged in (works on Streamlit Cloud)
+                try:
+                    _url_token = _create_url_session_token(_username, _db_key, "groq")
+                    st.query_params["session"] = _url_token
+                except Exception:
+                    pass
                 # Remember me checked → long-lived cookie (logout tak logged in). Unchecked → sirf current session, browser band = logout.
                 _remember = _remember_param in (True, "1", 1, "true", "yes") or (_remember_param and str(_remember_param).strip().lower() in ("1", "true", "yes"))
                 if _remember:
+                    _save_persistent_session()
                     _safe_sid = sid.replace("\\", "\\\\").replace('"', '\\"').replace(";", "")[:512]
                     components.html(f'<script>(function(){{var c="elastic_sid={_safe_sid}; path=/; max-age=7776000; SameSite=Lax"; try{{if(window.top.document)window.top.document.cookie=c;}}catch(e){{}} try{{document.cookie=c;}}catch(e){{}} }})();</script>', height=0)
                 _b64 = base64.urlsafe_b64encode(_lk.encode()).decode().rstrip("=")
@@ -972,10 +1173,11 @@ if not st.session_state.authenticated:
     .auth-signup { margin: 14px 0 0 0 !important; font-size: 13px !important; color: #64748b !important; text-align: center !important; }
     .auth-signup-link { color: #1f4ed8 !important; text-decoration: none !important; font-weight: 500 !important; }
     .auth-signup-link:hover { text-decoration: underline !important; }
-    /* Right section: image left block jitni height (logo se "Don't have an account?" tak) ke barabar, dono ek level */
+    /* Logo aur right image align: left col end ke baad fixed gap, phir image start */
+    [data-testid="stHorizontalBlock"]:has(#auth-form-ref) > [data-testid="column"]:last-child { padding-left: 28px !important; box-sizing: border-box !important; display: flex !important; align-items: center !important; justify-content: flex-start !important; min-height: 100vh !important; background: #ffffff !important; }
     [data-testid="column"]:last-child { padding: 1.5rem !important; display: flex !important; align-items: center !important; justify-content: center !important; min-height: 100vh !important; height: 100vh !important; background: #ffffff !important; }
-    .auth-split-right-panel { width: 100% !important; height: 100% !important; min-height: 100vh !important; display: flex !important; align-items: center !important; justify-content: center !important; background: transparent !important; }
-    .auth-split-illus-wrap { width: 90% !important; max-width: 580px !important; height: 100% !important; max-height: 90vh !important; min-height: 420px !important; display: flex !important; align-items: center !important; justify-content: center !important; padding: 0 !important; }
+    .auth-split-right-panel { width: 100% !important; height: 100% !important; min-height: 100vh !important; display: flex !important; align-items: center !important; justify-content: flex-start !important; background: transparent !important; padding-left: 0 !important; }
+    .auth-split-illus-wrap { width: 100% !important; max-width: 480px !important; height: 100% !important; max-height: 90vh !important; min-height: 420px !important; display: flex !important; align-items: center !important; justify-content: flex-start !important; padding: 0 !important; }
     .auth-split-illus-wrap img { max-height: 100% !important; height: 100% !important; width: auto !important; max-width: 100% !important; object-fit: contain !important; display: block !important; }
     .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child input { padding: 0 1rem !important; font-size: 14px !important; }
     .main [data-testid="stHorizontalBlock"] [data-testid="column"]:first-child input:focus { border-color: #1f4ed8 !important; box-shadow: 0 0 0 3px rgba(31,78,216,0.15) !important; outline: none !important; }
@@ -1076,7 +1278,7 @@ if not st.session_state.authenticated:
                 '<div class="auth-split-brand">' + _logo_html + '</div>'
                 + _success_block + _err_block +
                 '<form method="get" action="" id="auth-login-form" class="auth-form-manual">'
-                '<input type="text" name="login_username" class="auth-input auth-input-email" placeholder="Username" autocomplete="username" />'
+                '<input type="text" name="login_username" class="auth-input auth-input-email" placeholder="Username or email" autocomplete="username" />'
                 '<input type="password" name="login_key" class="auth-input auth-input-password" placeholder="Groq API key (same as signup)" autocomplete="off" />'
                 '<div class="auth-remember-forgot">'
                 '<label class="auth-remember-label"><input type="checkbox" name="remember" value="1" class="auth-checkbox" /> Remember me</label>'
@@ -1105,8 +1307,8 @@ if not st.session_state.authenticated:
                     label_visibility="collapsed",
                 )
                 _signup_username = st.text_input(
-                    "Username",
-                    placeholder="Username (for login)",
+                    "Username or email",
+                    placeholder="Username or email (for login)",
                     key="signup_username",
                     label_visibility="collapsed",
                 )
@@ -1903,6 +2105,8 @@ div:has(> .menu-dropdown-spacer) .stButton > button:hover {
 @st.cache_resource
 def load_generator(api_key: str = ""):
     """api_key: from session (user-entered) or pass env key; cache is per key."""
+    if Generator is None:
+        return None
     key = (api_key or "").strip() or os.getenv("GROQ_API_KEY", "")
     gen = Generator(api_key=key)
     return gen
@@ -1934,11 +2138,11 @@ def init():
             pass
         st.session_state["_runtime_version"] = BACKEND_RUNTIME_VERSION
     
-    if not st.session_state.ingestor:
+    if not st.session_state.ingestor and BulkIngest is not None:
         try: st.session_state.ingestor = BulkIngest()
         except Exception as e: st.error(f"Backend error: {e}")
     
-    if not st.session_state.searcher:
+    if not st.session_state.searcher and HybridSearch is not None:
         try: st.session_state.searcher = HybridSearch()
         except Exception as e: st.error(f"Search error: {e}")
     
@@ -1947,7 +2151,7 @@ def init():
             with st.spinner("🚀 Loading AI model..."):
                 _key = st.session_state.get("groq_api_key") or os.getenv("GROQ_API_KEY") or ""
                 st.session_state.generator = load_generator(_key)
-                st.session_state.model_loaded = True
+                st.session_state.model_loaded = True  # only retry once per session; generator may be None if backend failed
         except Exception as e:
             st.error(f"❌ Model failed to load: {e}")
 
@@ -2236,18 +2440,19 @@ else:
                                         reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
                                         text = "\n\n".join([p.extract_text() or "" for p in reader.pages])
                                         if text.strip():
-                                            result = st.session_state.ingestor.bulk_index_document(text, uploaded_file.name)
-                                            st.session_state.docs.append(uploaded_file.name)
-                                            # store original bytes for download/open
-                                            st.session_state.doc_files[uploaded_file.name] = pdf_bytes
-                                            # show doc badge only on next user message
-                                            pending = st.session_state.get("_pending_docs_for_badge") or []
-                                            if uploaded_file.name not in pending:
-                                                pending.append(uploaded_file.name)
-                                            st.session_state["_pending_docs_for_badge"] = pending
-                                            chunks = result.get("chunks", "?") if isinstance(result, dict) else "?"
-                                            t = result.get("time", "?") if isinstance(result, dict) else "?"
-                                            st.success(f"✅ Indexed: {chunks} chunks in {t}s")
+                                            if not st.session_state.get("ingestor"):
+                                                st.error("Indexing unavailable. Check backend dependencies.")
+                                            else:
+                                                result = st.session_state.ingestor.bulk_index_document(text, uploaded_file.name)
+                                                st.session_state.docs.append(uploaded_file.name)
+                                                st.session_state.doc_files[uploaded_file.name] = pdf_bytes
+                                                pending = st.session_state.get("_pending_docs_for_badge") or []
+                                                if uploaded_file.name not in pending:
+                                                    pending.append(uploaded_file.name)
+                                                st.session_state["_pending_docs_for_badge"] = pending
+                                                chunks = result.get("chunks", "?") if isinstance(result, dict) else "?"
+                                                t = result.get("time", "?") if isinstance(result, dict) else "?"
+                                                st.success(f"✅ Indexed: {chunks} chunks in {t}s")
                                 except Exception as e:
                                     st.error(str(e))
                                 finally:
@@ -2381,18 +2586,19 @@ else:
                                         reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
                                         text = "\n\n".join([p.extract_text() or "" for p in reader.pages])
                                         if text.strip():
-                                            result = st.session_state.ingestor.bulk_index_document(text, uploaded_file.name)
-                                            st.session_state.docs.append(uploaded_file.name)
-                                            # store original bytes for download/open
-                                            st.session_state.doc_files[uploaded_file.name] = pdf_bytes
-                                            # show doc badge only on next user message
-                                            pending = st.session_state.get("_pending_docs_for_badge") or []
-                                            if uploaded_file.name not in pending:
-                                                pending.append(uploaded_file.name)
-                                            st.session_state["_pending_docs_for_badge"] = pending
-                                            chunks = result.get("chunks", "?") if isinstance(result, dict) else "?"
-                                            t = result.get("time", "?") if isinstance(result, dict) else "?"
-                                            st.success(f"✅ Indexed: {chunks} chunks in {t}s")
+                                            if not st.session_state.get("ingestor"):
+                                                st.error("Indexing unavailable. Check backend dependencies.")
+                                            else:
+                                                result = st.session_state.ingestor.bulk_index_document(text, uploaded_file.name)
+                                                st.session_state.docs.append(uploaded_file.name)
+                                                st.session_state.doc_files[uploaded_file.name] = pdf_bytes
+                                                pending = st.session_state.get("_pending_docs_for_badge") or []
+                                                if uploaded_file.name not in pending:
+                                                    pending.append(uploaded_file.name)
+                                                st.session_state["_pending_docs_for_badge"] = pending
+                                                chunks = result.get("chunks", "?") if isinstance(result, dict) else "?"
+                                                t = result.get("time", "?") if isinstance(result, dict) else "?"
+                                                st.success(f"✅ Indexed: {chunks} chunks in {t}s")
                                 except Exception as e:
                                     st.error(str(e))
                                 finally:
@@ -2481,7 +2687,10 @@ else:
                 use_reranker = not is_summary  # reranker narrows topics, bad for summaries
 
                 with st.spinner("🔍 Searching documents..."):
-                    if is_generic_followup and st.session_state.get("last_response"):
+                    if not st.session_state.get("searcher"):
+                        resp = {"results": [], "total_latency": 0, "search_time": 0, "rerank_time": 0, "embedding_time": 0, "cached": False}
+                        print("\n🔎 [FRONT] Search skipped (backend not loaded)")
+                    elif is_generic_followup and st.session_state.get("last_response"):
                         resp = st.session_state.last_response
                         print("\n🔎 [FRONT] Reusing last_response results for generic follow-up")
                     else:
@@ -2633,10 +2842,13 @@ else:
                         except Exception:
                             pass
 
-                        answer = st.session_state.generator.generate(
-                            query=gen_query, docs=docs, history=history, top_score=score
-                        )
-                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                        if not st.session_state.get("generator"):
+                            st.session_state.messages.append({"role": "assistant", "content": "❌ AI model unavailable. Check backend dependencies (e.g. groq, backend.generator)."})
+                        else:
+                            answer = st.session_state.generator.generate(
+                                query=gen_query, docs=docs, history=history, top_score=score
+                            )
+                            st.session_state.messages.append({"role": "assistant", "content": answer})
                         st.session_state.last_response = {**metrics, "results": results}
 
                         # Har successful answer ke baad current conversation ko per-user history mein save karo

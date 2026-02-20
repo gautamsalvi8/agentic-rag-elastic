@@ -6,18 +6,22 @@ from sentence_transformers import SentenceTransformer
 from elasticsearch import Elasticsearch
 
 
+_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv(os.path.join(_root, ".env"))
 load_dotenv()
+
+def _es_client():
+    url = os.getenv("ELASTIC_URL") or "http://localhost:9200"
+    api_key = os.getenv("ELASTIC_API_KEY")
+    if api_key:
+        return Elasticsearch(hosts=[url], api_key=api_key)
+    return Elasticsearch(hosts=[url], basic_auth=("elastic", os.getenv("ELASTIC_PASSWORD", "changeme")))
 
 class SemanticSearch:
 
     def __init__(self):
         self.model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-        self.es = Elasticsearch(
-            "http://localhost:9200",
-            basic_auth=("elastic", os.getenv("ELASTIC_PASSWORD"))
-        )
-
+        self.es = _es_client()
         self.index = "rag-docs"
 
     def search(self, query, k=5):

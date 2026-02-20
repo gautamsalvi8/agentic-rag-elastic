@@ -18,14 +18,19 @@ from sentence_transformers import SentenceTransformer
 
 from chunker import chunk_text
 
+_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv(os.path.join(_root, ".env"))
 load_dotenv()
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+def _es_client():
+    url = os.getenv("ELASTIC_URL") or "http://localhost:9200"
+    api_key = os.getenv("ELASTIC_API_KEY")
+    if api_key:
+        return Elasticsearch(hosts=[url], api_key=api_key)
+    return Elasticsearch(hosts=[url], basic_auth=("elastic", os.getenv("ELASTIC_PASSWORD", "changeme")))
 
-es = Elasticsearch(
-    "http://localhost:9200",
-    basic_auth=("elastic", os.getenv("ELASTIC_PASSWORD"))
-)
+model = SentenceTransformer("all-MiniLM-L6-v2")
+es = _es_client()
 
 
 # ------------------------
