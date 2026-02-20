@@ -146,6 +146,9 @@ SESSION_STORE_PATH = os.path.join(tempfile.gettempdir(), "elastic_session_store.
 # URL-based persistent sessions (survives restart; bookmark URL with ?session=token)
 SESSIONS_DB = os.path.join(os.path.dirname(__file__), "sessions.json")
 URL_SESSION_EXPIRY_DAYS = 30
+# OAuth state & signed sid expiry (seconds)
+OAUTH_STATE_MAX_AGE_SEC = 600
+SESSION_TOKEN_MAX_AGE_SEC = 300  # 5 min
 # Supabase: agar set hai to sessions DB mein store (Streamlit Cloud restart pe bhi login rahega)
 _supabase_client = None
 def _get_supabase():
