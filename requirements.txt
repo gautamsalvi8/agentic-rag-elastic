@@ -30,3 +30,4 @@ psutil
 plotly
 pandas
 PyPDF2
+supabase

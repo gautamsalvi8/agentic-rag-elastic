@@ -34,9 +34,9 @@ import time
 import pandas as pd
 import plotly.express as px
 
-# Streamlit Cloud: secrets TOML is in st.secrets; backend uses os.getenv(). Copy so backend gets ELASTIC_* and USE_GROQ_API.
+# Streamlit Cloud: secrets TOML is in st.secrets; backend uses os.getenv(). Copy so backend gets ELASTIC_* and USE_GROQ_API, SUPABASE_*.
 def _env_from_secrets():
-    for key in ("ELASTIC_URL", "ELASTIC_API_KEY", "USE_GROQ_API", "GROQ_API_KEY"):
+    for key in ("ELASTIC_URL", "ELASTIC_API_KEY", "USE_GROQ_API", "GROQ_API_KEY", "SUPABASE_URL", "SUPABASE_KEY", "SUPABASE_SERVICE_KEY"):
         if os.environ.get(key):
             continue
         try:
@@ -106,12 +106,10 @@ def _handle_logout():
             store = _load_session_store()
             store.pop(_sid, None)
             _save_session_store(store)
-        # Remove URL session token from sessions.json so link no longer works
+        # Remove URL session token (Supabase or sessions.json) so link no longer works
         _url_tok = st.query_params.get("session") if hasattr(st, "query_params") and hasattr(st.query_params, "get") else None
         if _url_tok:
-            sessions = _load_url_sessions()
-            sessions.pop(_url_tok, None)
-            _save_url_sessions(sessions)
+            _delete_url_session_token(_url_tok)
         try:
             if hasattr(st, "query_params") and hasattr(st.query_params, "clear"):
                 st.query_params.clear()
@@ -148,12 +146,29 @@ SESSION_STORE_PATH = os.path.join(tempfile.gettempdir(), "elastic_session_store.
 # URL-based persistent sessions (survives restart; bookmark URL with ?session=token)
 SESSIONS_DB = os.path.join(os.path.dirname(__file__), "sessions.json")
 URL_SESSION_EXPIRY_DAYS = 30
-# OAuth state & session: file/store mat use karo — Streamlit Cloud pe alag instance pe file nahi milti. Signed tokens use karo.
-OAUTH_STATE_MAX_AGE_SEC = 600
-SESSION_TOKEN_MAX_AGE_SEC = 300  # 5 min
+# Supabase: agar set hai to sessions DB mein store (Streamlit Cloud restart pe bhi login rahega)
+_supabase_client = None
+def _get_supabase():
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY")
+    if not key and hasattr(st, "secrets"):
+        key = getattr(st.secrets, "SUPABASE_KEY", None) or getattr(st.secrets, "SUPABASE_SERVICE_KEY", None)
+    if not url and hasattr(st, "secrets"):
+        url = getattr(st.secrets, "SUPABASE_URL", None)
+    if url and key:
+        try:
+            from supabase import create_client
+            _supabase_client = create_client(url.strip(), key.strip())
+            return _supabase_client
+        except Exception:
+            pass
+    return None
 
 def _load_url_sessions():
-    """Load session token -> {username, _user_db_key, auth_provider, created} from sessions.json."""
+    """Load session token -> {username, _user_db_key, auth_provider, created} from file (fallback)."""
     try:
         if os.path.exists(SESSIONS_DB):
             with open(SESSIONS_DB, "r", encoding="utf-8") as f:
@@ -170,8 +185,20 @@ def _save_url_sessions(sessions):
         pass
 
 def _create_url_session_token(username: str, db_key: str, provider: str) -> str:
-    """Create persistent URL session token; save to sessions.json. Returns token."""
+    """Create persistent URL session token; save to Supabase (if configured) else sessions.json. Returns token."""
     token = secrets.token_urlsafe(16)
+    sb = _get_supabase()
+    if sb is not None:
+        try:
+            sb.table("app_sessions").insert({
+                "token": token,
+                "username": username or "User",
+                "user_db_key": db_key or "",
+                "auth_provider": provider or "google",
+            }).execute()
+            return token
+        except Exception:
+            pass
     sessions = _load_url_sessions()
     sessions[token] = {
         "username": username,
@@ -183,24 +210,68 @@ def _create_url_session_token(username: str, db_key: str, provider: str) -> str:
     return token
 
 def _validate_url_session_token(token: str):
-    """Validate URL session token. Returns session dict or None."""
+    """Validate URL session token (Supabase or file). Returns session dict or None."""
     if not (token or "").strip():
         return None
+    t = (token or "").strip()
+    sb = _get_supabase()
+    if sb is not None:
+        try:
+            r = sb.table("app_sessions").select("*").eq("token", t).limit(1).execute()
+            if r.data and len(r.data) > 0:
+                row = r.data[0]
+                created = row.get("created_at") or ""
+                if created:
+                    try:
+                        from datetime import timezone as _tz
+                        created_dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+                        if getattr(created_dt, "tzinfo", None) is None:
+                            created_dt = created_dt.replace(tzinfo=_tz.utc)
+                        if (datetime.now(_tz.utc) - created_dt) > timedelta(days=URL_SESSION_EXPIRY_DAYS):
+                            sb.table("app_sessions").delete().eq("token", t).execute()
+                            return None
+                    except Exception:
+                        pass
+                return {
+                    "username": row.get("username", "User"),
+                    "_user_db_key": row.get("user_db_key", ""),
+                    "auth_provider": row.get("auth_provider", "google"),
+                    "created": str(created),
+                }
+            return None
+        except Exception:
+            return None
     sessions = _load_url_sessions()
-    data = sessions.get((token or "").strip())
+    data = sessions.get(t)
     if not data or not isinstance(data, dict):
         return None
     created = data.get("created") or ""
     if created:
         try:
-            created_dt = datetime.fromisoformat(created)
-            if datetime.now() - created_dt > timedelta(days=URL_SESSION_EXPIRY_DAYS):
-                del sessions[(token or "").strip()]
+            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            if datetime.now(created_dt.tzinfo if getattr(created_dt, "tzinfo", None) else None) - created_dt > timedelta(days=URL_SESSION_EXPIRY_DAYS):
+                del sessions[t]
                 _save_url_sessions(sessions)
                 return None
         except Exception:
             pass
     return data
+
+def _delete_url_session_token(token: str):
+    """Remove session token (logout / invalidate). Supabase or file."""
+    if not (token or "").strip():
+        return
+    t = (token or "").strip()
+    sb = _get_supabase()
+    if sb is not None:
+        try:
+            sb.table("app_sessions").delete().eq("token", t).execute()
+            return
+        except Exception:
+            pass
+    sessions = _load_url_sessions()
+    sessions.pop(t, None)
+    _save_url_sessions(sessions)
 
 def _load_users():
     if os.path.exists(USER_DB):
