@@ -853,6 +853,12 @@ if _code and _state and not st.session_state.authenticated:
             pass
         # URL session token so refresh/bookmark keeps user logged in (works on Streamlit Cloud)
         _url_token_google = _create_url_session_token(st.session_state.username, db_key, "google")
+        # Cookie mein bhi save — app band karke dubara open karne pe redirect ?session= milega
+        try:
+            _safe_ut = _url_token_google.replace("\\", "\\\\").replace('"', '\\"').replace(";", "")[:128]
+            components.html(f'<script>(function(){{var c="elastic_session_url={_safe_ut}; path=/; max-age=2592000; SameSite=Lax"; try{{if(window.top.document)window.top.document.cookie=c;}}catch(e){{}} try{{document.cookie=c;}}catch(e){{}} }})();</script>', height=0)
+        except Exception:
+            pass
         # URL update ke liye: sid + session set karo, rerun
         st.session_state["_oauth_pending_sid"] = sid
         try:
@@ -960,19 +966,34 @@ if not st.session_state.authenticated and not _sid and not _code:
             var c = "elastic_sid=; path=/; max-age=0; Secure";
             try { if (window.top.document) window.top.document.cookie = c; } catch(e) {}
             try { document.cookie = c; } catch(e) {}
+            var c2 = "elastic_session_url=; path=/; max-age=0";
+            try { if (window.top.document) window.top.document.cookie = c2; } catch(e) {}
+            try { document.cookie = c2; } catch(e) {}
             try { localStorage.removeItem('elastic_groq_key'); localStorage.removeItem('elastic_hf_key'); } catch(e) {}
         })();</script>"""
         components.html(_clear_cookie, height=0)
         st.session_state["_just_logged_out"] = False
+    # sid ya session URL mein nahi hai to cookie se redirect — app band karke dubara open pe bhi login rahe
     _cookie_restore_html = """
     <script>
     (function() {
         var doc = (window.top && window.top.document) ? window.top.document : document;
         var c = doc.cookie || "";
-        if (window.location.search.includes("sid=") || window.location.search.includes("code=")) return;
+        var search = window.location.search || "";
+        if (search.includes("code=")) return;
+        if (!search.includes("session=")) {
+            var mSession = c.match(/elastic_session_url=([^;]+)/);
+            if (mSession) {
+                var q = search ? search + "&" : "?";
+                if (search.includes("session=")) return;
+                window.top.location.replace(window.location.pathname + q + "session=" + encodeURIComponent(mSession[1].trim()));
+                return;
+            }
+        }
+        if (search.includes("sid=") || search.includes("session=")) return;
         var m = c.match(/elastic_sid=([^;]+)/);
         if (m) {
-            var q = window.location.search ? window.location.search + "&" : "?";
+            var q = search ? search + "&" : "?";
             window.top.location.replace(window.location.pathname + q + "sid=" + encodeURIComponent(m[1].trim()));
         }
     })();
@@ -1011,6 +1032,9 @@ if not st.session_state.authenticated:
                 try:
                     _url_token = _create_url_session_token(_username, _db_key, "groq")
                     st.query_params["session"] = _url_token
+                    # Cookie mein bhi save — app band karke dubara open karne pe isi se redirect ?session= milega
+                    _safe_url_tok = _url_token.replace("\\", "\\\\").replace('"', '\\"').replace(";", "")[:128]
+                    components.html(f'<script>(function(){{var c="elastic_session_url={_safe_url_tok}; path=/; max-age=2592000; SameSite=Lax"; try{{if(window.top.document)window.top.document.cookie=c;}}catch(e){{}} try{{document.cookie=c;}}catch(e){{}} }})();</script>', height=0)
                 except Exception:
                     pass
                 # Remember me checked → long-lived cookie (logout tak logged in). Unchecked → sirf current session, browser band = logout.
