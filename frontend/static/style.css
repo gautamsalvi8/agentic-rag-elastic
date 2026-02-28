@@ -1,0 +1,122 @@
+/* Remove Streamlit branding */
+[data-testid="stHeader"] {
+    display: none !important;
+}
+
+footer {
+    visibility: hidden !important;
+}
+
+#MainMenu {
+    visibility: hidden !important;
+}
+
+.stDeployButton {
+    display: none !important;
+}
+
+/* Main layout */
+.main .block-container {
+    padding: 1.5rem 2rem !important;
+    max-width: 1200px !important;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: #ffffff;
+    border-right: 2px solid #e5e7eb;
+}
+
+/* Chat messages */
+[data-testid="stChatMessage"] {
+    padding: 1.2rem !important;
+    margin: 0.8rem 0 !important;
+    border-radius: 12px !important;
+}
+
+[data-testid="stChatMessage"][data-testid-value="user"] {
+    background: #eff6ff !important;
+    border-left: 4px solid #3b82f6 !important;
+}
+
+[data-testid="stChatMessage"][data-testid-value="assistant"] {
+    background: #f0fdf4 !important;
+    border-left: 4px solid #10b981 !important;
+}
+
+/* Chat input */
+.stChatInput > div {
+    border-radius: 24px !important;
+    border: 2px solid #e5e7eb !important;
+}
+
+.stChatInput > div:focus-within {
+    border-color: #3b82f6 !important;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1) !important;
+}
+
+/* Buttons */
+.stButton > button {
+    border-radius: 10px !important;
+    padding: 0.5rem 1rem !important;
+    transition: all 0.2s !important;
+}
+
+.stButton > button:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1) !important;
+}
+
+/* Plus button */
+button[key="upload_trigger"] {
+    width: 48px !important;
+    height: 48px !important;
+    border-radius: 50% !important;
+    font-size: 20px !important;
+}
+
+/* File uploader */
+.stFileUploader {
+    border: 2px dashed #cbd5e1;
+    border-radius: 12px;
+    padding: 2rem;
+    background: #f9fafb;
+}
+
+.stFileUploader:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+}
+
+/* Metrics */
+.stMetric {
+    background: #f9fafb;
+    padding: 0.8rem;
+    border-radius: 8px;
+    border: 1px solid #e5e7eb;
+}
+
+/* Messages */
+.stSuccess {
+    background: #f0fdf4 !important;
+    border-radius: 8px !important;
+    padding: 1rem !important;
+}
+
+.stWarning {
+    background: #fffbeb !important;
+    border-radius: 8px !important;
+    padding: 1rem !important;
+}
+
+.stError {
+    background: #fef2f2 !important;
+    border-radius: 8px !important;
+    padding: 1rem !important;
+}
+
+.stInfo {
+    background: #eff6ff !important;
+    border-radius: 8px !important;
+    padding: 1rem !important;
+}
